@@ -188,7 +188,9 @@ class ArrowDataset(BaseDataset):
                 f"train_ratio={train_ratio} gives split_idx={split_idx})"
             )
         self.start_file_idx = start
-        self.data = self.data.select(range(start, stop))
+        # Native prepare-data Arrow rows contain Python lists by default, while
+        # the online hidden-state path and collator require tensors.
+        self.data = self.data.select(range(start, stop)).with_format("torch")
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
         self.vllm_endpoint = vllm_endpoint

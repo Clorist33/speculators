@@ -317,7 +317,7 @@ def _make_generation_dataset(
         transfer=transfer,  # type: ignore[arg-type]
         **kwargs,
     )
-    arrow_ds.data.set_format(type="torch")
+    assert isinstance(arrow_ds.data[0]["input_ids"], torch.Tensor)
     arrow_ds.client = object()  # type: ignore[assignment]
     arrow_ds.model = "model"
     return arrow_ds

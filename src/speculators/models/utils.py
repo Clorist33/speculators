@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 # exactly against the verifier's effective `model_type` (after text_config
 # extraction) — gemma3n and gemma4 dropped this convention, so prefix
 # matching would over-include. Qwen3.5 is in here because transformers'
-# Qwen3_5RMSNorm computes `output * (1.0 + weight)` and vLLM's is an alias
-# of GemmaRMSNorm.
+# Qwen3_5RMSNorm and Qwen3_5MoeRMSNorm compute `output * (1.0 + weight)`.
+# Qwen3.6 MoE checkpoints also use the qwen3_5_moe_text model type.
 GEMMA_STYLE_FINAL_NORM_MODEL_TYPES = frozenset(
     (
         "gemma",
@@ -25,6 +25,8 @@ GEMMA_STYLE_FINAL_NORM_MODEL_TYPES = frozenset(
         "gemma3_text",
         "qwen3_5",
         "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
         "recurrent_gemma",
     )
 )

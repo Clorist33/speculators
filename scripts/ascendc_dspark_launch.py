@@ -1,0 +1,199 @@
+"""AscendC DSpark 启动辅助：只读检查、数据格式转换及本次运行的草稿配置。"""
+import contextlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+def check_vllm():
+    import os
+
+    def positive(name):
+        raw = os.environ[name]
+        if not raw.isdigit() or int(raw) <= 0:
+            raise SystemExit(f'{name} must be a positive integer')
+        return int(raw)
+
+    limit = positive('VLLM_MAX_MODEL_LEN')
+    batch = positive('VLLM_MAX_NUM_BATCHED_TOKENS')
+    seqs = positive('VLLM_MAX_NUM_SEQS')
+    for name in ('VLLM_ENABLE_CHUNKED_PREFILL', 'VLLM_ENFORCE_EAGER'):
+        if os.environ[name] not in ('0', '1'):
+            raise SystemExit(f'{name} must be 0 or 1')
+    try:
+        ratio = float(os.environ['VLLM_GPU_MEMORY_UTILIZATION'])
+    except ValueError:
+        raise SystemExit('VLLM_GPU_MEMORY_UTILIZATION must be in (0,1]')
+    if not 0 < ratio <= 1:
+        raise SystemExit('VLLM_GPU_MEMORY_UTILIZATION must be in (0,1]')
+    if os.environ['VLLM_KV_CACHE_MEMORY_BYTES']:
+        positive('VLLM_KV_CACHE_MEMORY_BYTES')
+    if limit < positive('SEQ_LENGTH') + 1 or limit % 32:
+        raise SystemExit('VLLM_MAX_MODEL_LEN must cover SEQ_LENGTH+1 and be a multiple of 32')
+    if os.environ['VLLM_ENABLE_CHUNKED_PREFILL'] == '0' and batch < limit:
+        raise SystemExit('Without chunked prefill, VLLM_MAX_NUM_BATCHED_TOKENS must be >= VLLM_MAX_MODEL_LEN')
+    if batch < seqs:
+        raise SystemExit('VLLM_MAX_NUM_BATCHED_TOKENS must be >= VLLM_MAX_NUM_SEQS')
+
+
+def check_config():
+    import ast
+    import json
+    import os
+    from pathlib import Path
+
+    errors = []
+    def read_config(directory):
+        path = Path(directory) / 'config.json'
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            errors.append(f'{path}: {exc}')
+            return {}
+
+    teacher = read_config(os.environ['MODEL'])
+    draft = read_config(os.environ['DRAFT_MODEL'])
+    text = teacher.get('text_config', teacher)
+    expected = {'speculators_model_type': 'dspark', 'draft_vocab_size': 248320,
+                'aux_hidden_state_layer_ids': [2, 10, 20, 30, 37], 'block_size': 8,
+                'markov_rank': 256, 'markov_head_type': 'vanilla',
+                'enable_confidence_head': True, 'confidence_head_with_markov': True,
+                'sample_from_anchor': True, 'mask_token_id': 248077}
+    for key, value in expected.items():
+        if draft.get(key) != value:
+            errors.append(f'draft {key}: expected {value!r}, got {draft.get(key)!r}')
+    layer = draft.get('transformer_layer_config', {})
+    for key, value in {'num_hidden_layers': 5, 'hidden_size': 2048}.items():
+        if layer.get(key) != value:
+            errors.append(f'draft transformer {key} must remain {value}')
+    for key, value in {'num_hidden_layers': 40, 'hidden_size': 2048, 'vocab_size': 248320}.items():
+        if text.get(key) != value:
+            errors.append(f'teacher text config {key}: expected {value}, got {text.get(key)}')
+    if not (Path(os.environ['DRAFT_MODEL']) / 'model.safetensors').is_file():
+        errors.append('Missing pretrained model.safetensors; config-only initialization is forbidden')
+    if not (Path(os.environ['MODEL']) / 'model.safetensors.index.json').is_file():
+        errors.append('Missing teacher sharded weight index')
+    raw = Path(os.environ['RAW_DATA_DIR'])
+    print(f'Raw operator data: {raw} ({len(list(raw.glob("train-[0-9][0-9][0-9][0-9][0-9].jsonl")))} JSONL shards)')
+    if not list(raw.glob('train-[0-9][0-9][0-9][0-9][0-9].jsonl')):
+        errors.append('No raw operator JSONL shards found')
+    data = Path(os.environ['DATA_PATH'])
+    if data.suffix == '.jsonl':
+        if not data.is_file():
+            errors.append(f'Prepared JSONL missing at {data}')
+        if not os.environ['TRAIN_ROWS'] and not Path(str(data) + '.manifest.json').is_file():
+            errors.append('JSONL requires its preparation manifest or explicit TRAIN_ROWS')
+    else:
+        if not (data / 'state.json').is_file() or not (data / 'dataset_info.json').is_file():
+            errors.append(f'Prepared Arrow Dataset missing at {data}')
+        if not os.environ['TRAIN_ROWS'] and not (data / 'split.json').is_file():
+            errors.append('Set TRAIN_ROWS from the group split or supply DATA_PATH/split.json')
+    if Path(os.environ['OUTPUT_DIR']).exists():
+        errors.append('OUTPUT_DIR already exists; use a new run directory (old optimizer states are not resumed)')
+    for key in ('SEQ_LENGTH', 'MAX_ANCHORS'):
+        try:
+            assert int(os.environ[key]) > 8
+        except (ValueError, AssertionError):
+            errors.append(f'{key} must be an integer greater than 8')
+    def devices(key):
+        ids = os.environ[key].split(',')
+        if not ids or any(not s.isdigit() for s in ids) or len(set(ids)) != len(ids):
+            errors.append(f'{key} must contain unique, comma-separated numeric NPU IDs')
+        return set(ids)
+    if os.environ['LAUNCH_TEACHER'] == '1':
+        limit = int(os.environ['VLLM_MAX_MODEL_LEN'])
+        supported = text.get('max_position_embeddings')
+        if supported is not None and limit > int(supported):
+            errors.append(f'Teacher limit {limit} exceeds configured max_position_embeddings={supported}')
+        cache = os.environ['VLLM_KV_CACHE_MEMORY_BYTES']
+        print('Teacher memory:', f'explicit cache {cache} bytes/NPU (utilization does not size cache)' if cache
+              else f'automatic cache, gpu-memory-utilization={os.environ["VLLM_GPU_MEMORY_UTILIZATION"]}')
+        print('Teacher limits:', limit, 'batched tokens:', os.environ['VLLM_MAX_NUM_BATCHED_TOKENS'],
+              'max sequences:', os.environ['VLLM_MAX_NUM_SEQS'],
+              'chunked prefill:', os.environ['VLLM_ENABLE_CHUNKED_PREFILL'])
+    train_ids = devices('TRAIN_NPUS')
+    if os.environ['LAUNCH_TEACHER'] == '1' and train_ids & devices('VLLM_NPUS'):
+        errors.append('Teacher and trainer NPU assignments overlap')
+
+    # Fail closed on the known final-norm bug without importing the model stack.
+    # This check must be revised if the registry implementation is refactored.
+    source = Path(os.environ['REPO_ROOT']) / 'src/speculators/models/utils.py'
+    registry = None
+    for node in ast.parse(source.read_text()).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and
+                t.id == 'GEMMA_STYLE_FINAL_NORM_MODEL_TYPES' for t in node.targets):
+            if isinstance(node.value, ast.Call) and node.value.args:
+                registry = set(ast.literal_eval(node.value.args[0]))
+    if text.get('model_type') == 'qwen3_5_moe_text' and (
+            registry is None or 'qwen3_5_moe_text' not in registry):
+        errors.append('qwen3_5_moe_text is absent from the 1+w final-norm registry. '
+                      'Fix/verify teacher-logit reconstruction before training; this launcher does not patch it')
+    print('Teacher:', os.environ['MODEL'])
+    print('Original draft teacher:', draft.get('speculators_config', {}).get('verifier', {}).get('name_or_path'))
+    print('Draft: 5 layers, full vocabulary, aux=[2,10,20,30,37]; a run-local config will bind the new teacher')
+    if errors:
+        for error in errors:
+            print('BLOCKED:', error)
+        raise SystemExit(1)
+    print('Static configuration checks passed; numerical/NPU validation is still required.')
+
+
+def check_arrow():
+    import json
+    import math
+    import os
+    from pathlib import Path
+    from datasets import load_from_disk
+
+    path = Path(os.environ['DATA_PATH'])
+    data = load_from_disk(str(path)).with_format(None)
+    assert {'input_ids', 'loss_mask', 'seq_len'} <= set(data.column_names), 'Missing Arrow columns'
+    n = len(data)
+    train_rows = int(os.environ['TRAIN_ROWS'] or json.loads((path / 'split.json').read_text())['train_rows'])
+    assert 0 < train_rows < n, 'Both train and validation must be nonempty'
+    ratio = train_rows / n
+    if int(n * ratio) != train_rows:
+        ratio = math.nextafter(ratio, 1.0)
+    assert int(n * ratio) == train_rows, 'Cannot represent requested split'
+    print(repr(ratio))
+
+
+def stage_draft():
+    import json
+    import os
+    from pathlib import Path
+    src = Path(os.environ['DRAFT_MODEL']).resolve()
+    dst = Path(os.environ['INIT_DIR'])
+    config = json.loads((src / 'config.json').read_text())
+    config['speculators_config']['verifier']['name_or_path'] = str(Path(os.environ['MODEL']).resolve())
+    # Only the read-only weight file is shared; never import old optimizer/run state.
+    (dst / 'model.safetensors').symlink_to(src / 'model.safetensors')
+    (dst / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
+
+
+def data_ratio(action):
+    if os.environ['DATA_PATH'].endswith('.jsonl'):
+        command = [sys.executable, str(Path(__file__).with_name('prepare_ascendc_dspark_smoke.py')),
+                   'check' if action == 'check' else 'materialize',
+                   '--path', os.environ['DATA_PATH'], '--seq-length', os.environ['SEQ_LENGTH']]
+        if os.environ.get('TRAIN_ROWS'):
+            command += ['--train-rows', os.environ['TRAIN_ROWS']]
+        if action == 'prepare':
+            command += ['--output', os.environ['TRAIN_DATA_PATH']]
+        subprocess.run(command, check=True)
+    else:
+        check_arrow()
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2 or sys.argv[1] not in ('check', 'prepare'):
+        raise SystemExit('用法: python scripts/ascendc_dspark_launch.py check|prepare（参数由主脚本环境传入）')
+    if sys.argv[1] == 'check':
+        with contextlib.redirect_stdout(sys.stderr):
+            if os.environ['LAUNCH_TEACHER'] == '1':
+                check_vllm()
+            check_config()
+        data_ratio('check')
+    else:
+        data_ratio('prepare')
+        stage_draft()

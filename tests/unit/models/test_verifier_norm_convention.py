@@ -18,8 +18,10 @@ import pytest
 import torch
 from transformers.models.gemma3.modeling_gemma3 import Gemma3RMSNorm
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
 
-from speculators.models.dflash.core import DFlashDraftModel, DFlashSpeculatorConfig
+from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.utils import (
     resolve_verifier_norm_class,
     uses_gemma_style_final_norm,
@@ -50,6 +52,9 @@ def _point_at_fake_verifier(
     [
         ("qwen3_5", "", True),
         ("qwen3_5", "qwen3_5_text", True),
+        ("qwen3_5_moe", "", True),
+        ("qwen3_5_moe", "qwen3_5_moe_text", True),
+        ("qwen3_5_moe_text", "", True),
         ("gemma3_text", "", True),
         ("gemma2", "", True),
         ("gemma3n", "", False),  # dropped the (1 + w) convention
@@ -60,6 +65,9 @@ def _point_at_fake_verifier(
     ids=[
         "qwen3_5",
         "qwen3_5_text_nested",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text_nested",
+        "qwen3_5_moe_text",
         "gemma3_text",
         "gemma2",
         "gemma3n_negative",
@@ -98,17 +106,16 @@ def test_plain_construction_unchanged():
     assert isinstance(model.verifier_norm, Qwen3RMSNorm)
 
 
-@pytest.mark.parametrize(
-    "model_type", ["qwen3_5", "gemma3_text"], ids=["qwen3_5", "gemma3"]
-)
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe_text", "gemma3_text"])
+@pytest.mark.parametrize("model_cls", [DFlashDraftModel, DSparkDraftModel])
 def test_gemma_style_construction_swaps_class(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, model_type: str
+    tmp_path, monkeypatch: pytest.MonkeyPatch, model_type: str, model_cls
 ):
     """Gemma-convention verifiers construct verifier_norm as Gemma3RMSNorm
     and load the raw checkpoint weight unchanged (the +1 lives in forward)."""
-    model = _make_model(DFlashDraftModel, draft_vocab_size=64)
+    model = _make_model(model_cls, draft_vocab_size=64)
     _point_at_fake_verifier(model, tmp_path, model_type)
-    rebuilt = DFlashDraftModel(cast("DFlashSpeculatorConfig", model.config))
+    rebuilt = model_cls(model.config)
     assert isinstance(rebuilt.verifier_norm, Gemma3RMSNorm)
 
     # The weight must load verbatim: the convention is applied in forward,
@@ -122,7 +129,7 @@ def test_gemma_style_construction_swaps_class(
     )
     loaded = cast(
         "DFlashDraftModel",
-        DFlashDraftModel.from_pretrained(tmp_path / "draft", local_files_only=True),
+        model_cls.from_pretrained(tmp_path / "draft", local_files_only=True),
     )
     assert isinstance(loaded.verifier_norm, Gemma3RMSNorm)
     assert torch.equal(loaded.verifier_norm.weight, fake["model.norm.weight"])
@@ -142,3 +149,35 @@ def test_gemma3_rmsnorm_matches_folded_qwen3_rmsnorm():
     qwen_folded = Qwen3RMSNorm(16, eps=1e-6)
     qwen_folded.weight.data = w + 1.0
     torch.testing.assert_close(gemma(x), qwen_folded(x), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("zero_weight", [False, True], ids=["nonuniform", "zero"])
+def test_dspark_moe_teacher_logits_match_native_norm(tmp_path, dtype, zero_weight):
+    """Compare the actual DSpark verifier norm/head path with native Qwen MoE.
+
+    The zero-weight case is intentionally diagnostic: plain RMSNorm erases
+    every feature, while the teacher's offset parameterization has unit gain.
+    """
+    torch.manual_seed(17)
+    template = _make_model(DSparkDraftModel, draft_vocab_size=64)
+    _point_at_fake_verifier(template, tmp_path, "qwen3_5_moe", "qwen3_5_moe_text")
+    model = DSparkDraftModel(template.config).to(dtype=dtype).eval()
+    native = Qwen3_5MoeRMSNorm(16, eps=1e-6).to(dtype=dtype)
+    plain = Qwen3RMSNorm(16, eps=1e-6).to(dtype=dtype)
+    weight = torch.zeros(16) if zero_weight else torch.linspace(-0.4, 0.6, 16)
+    hidden = torch.randn(2, 7, 16).to(dtype)
+    with torch.no_grad():
+        for norm in (model.verifier_norm, native, plain):
+            norm.weight.copy_(weight)
+        model.verifier_lm_head.weight.normal_(std=0.2)
+        actual_hidden = model.verifier_norm(hidden)
+        expected_hidden = native(hidden)
+        actual_logits = model.verifier_lm_head(actual_hidden)
+        expected_logits = model.verifier_lm_head(expected_hidden)
+        wrong_logits = model.verifier_lm_head(plain(hidden))
+    torch.testing.assert_close(actual_hidden, expected_hidden, rtol=0, atol=0)
+    torch.testing.assert_close(actual_logits, expected_logits, rtol=0, atol=0)
+    assert torch.equal(actual_logits.argmax(-1), expected_logits.argmax(-1))
+    assert not torch.allclose(wrong_logits, expected_logits)
+    assert model.verifier_norm.weight.requires_grad is False

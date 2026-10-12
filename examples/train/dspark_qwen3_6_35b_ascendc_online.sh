@@ -13,11 +13,10 @@ PYTHON="python3"
 MODEL="/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16"
 DRAFT_MODEL="/home/weight/Qwen3.6-35B-A3B-Dspark"
 RAW_DATA_DIR="/home/t00972278/dataset/ascendc-kernelgen-data/dataset/agent_dataset"
-# 从 train-00000.jsonl 全部 1000 条轨迹中按轨迹选代表性回合；保留长回合。
-# mask 直接沿用已由框架原生工具处理并按 DSpark 位置对齐的 Arrow。
-# 全量 Arrow 仍在 formal-data/train00000_256k/data_arrow；当前已启动的训练不受此修改影响。
-DATA_PATH="/home/t00972278/Dspark_sft_docs/formal-data/train00000_256k_budget6h/data_arrow"
-TRAIN_ROWS=""  # 可留空，读取 Arrow/split.json 或 JSONL.manifest.json。
+# 先用 prepare_ascendc_dspark_trajectory.py 生成完整轨迹 Arrow；不接受原始 JSONL。
+# 此目录尚需生成并验证，不会回退到旧的按回答展开数据。
+DATA_PATH="/home/t00972278/Dspark_sft_docs/trajectory-data-new/data_arrow"
+TRAIN_ROWS=""  # 留空则读取 Arrow/split.json。
 RUN_TIME="$(date +%Y%m%d_%H%M%S)_$$"
 LOG_ROOT="/home/t00972278/Dspark_sft_docs/train-log"
 OUTPUT_DIR="$LOG_ROOT/run_$RUN_TIME"
@@ -64,7 +63,6 @@ VLLM_ENFORCE_EAGER="1" # 暂不照搬 FULL_DECODE_ONLY 图模式。
 # ============ 4. 检查数据并准备本次运行 ============
 INIT_DIR="$OUTPUT_DIR/initial_draft"
 TRAIN_DATA_PATH="$DATA_PATH"
-[[ "$DATA_PATH" != *.jsonl ]] || TRAIN_DATA_PATH="$OUTPUT_DIR/data_arrow"
 LAUNCH_TEACHER=0
 if [[ -z "$VLLM_ENDPOINT" ]]; then
     LAUNCH_TEACHER=1

@@ -1,7 +1,6 @@
-"""AscendC DSpark 启动辅助：只读检查、数据格式转换及本次运行的草稿配置。"""
+"""AscendC DSpark 启动辅助：Arrow 数据检查及本次运行的草稿配置。"""
 import contextlib
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -78,16 +77,10 @@ def check_config():
     if not list(raw.glob('train-[0-9][0-9][0-9][0-9][0-9].jsonl')):
         errors.append('No raw operator JSONL shards found')
     data = Path(os.environ['DATA_PATH'])
-    if data.suffix == '.jsonl':
-        if not data.is_file():
-            errors.append(f'Prepared JSONL missing at {data}')
-        if not os.environ['TRAIN_ROWS'] and not Path(str(data) + '.manifest.json').is_file():
-            errors.append('JSONL requires its preparation manifest or explicit TRAIN_ROWS')
-    else:
-        if not (data / 'state.json').is_file() or not (data / 'dataset_info.json').is_file():
-            errors.append(f'Prepared Arrow Dataset missing at {data}')
-        if not os.environ['TRAIN_ROWS'] and not (data / 'split.json').is_file():
-            errors.append('Set TRAIN_ROWS from the group split or supply DATA_PATH/split.json')
+    if not (data / 'state.json').is_file() or not (data / 'dataset_info.json').is_file():
+        errors.append(f'Prepared trajectory Arrow Dataset missing at {data}; run prepare_ascendc_dspark_trajectory.py first')
+    if not os.environ['TRAIN_ROWS'] and not (data / 'split.json').is_file():
+        errors.append('Set TRAIN_ROWS from the group split or supply DATA_PATH/split.json')
     if Path(os.environ['OUTPUT_DIR']).exists():
         errors.append('OUTPUT_DIR already exists; use a new run directory (old optimizer states are not resumed)')
     for key in ('SEQ_LENGTH', 'MAX_ANCHORS'):
@@ -171,19 +164,6 @@ def stage_draft():
     (dst / 'config.json').write_text(json.dumps(config, indent=2) + '\n')
 
 
-def data_ratio(action):
-    if os.environ['DATA_PATH'].endswith('.jsonl'):
-        command = [sys.executable, str(Path(__file__).with_name('prepare_ascendc_dspark_smoke.py')),
-                   'check' if action == 'check' else 'materialize',
-                   '--path', os.environ['DATA_PATH'], '--seq-length', os.environ['SEQ_LENGTH']]
-        if os.environ.get('TRAIN_ROWS'):
-            command += ['--train-rows', os.environ['TRAIN_ROWS']]
-        if action == 'prepare':
-            command += ['--output', os.environ['TRAIN_DATA_PATH']]
-        subprocess.run(command, check=True)
-    else:
-        check_arrow()
-
 
 if __name__ == '__main__':
     if len(sys.argv) != 2 or sys.argv[1] not in ('check', 'prepare'):
@@ -193,7 +173,7 @@ if __name__ == '__main__':
             if os.environ['LAUNCH_TEACHER'] == '1':
                 check_vllm()
             check_config()
-        data_ratio('check')
+        check_arrow()
     else:
-        data_ratio('prepare')
+        check_arrow()
         stage_draft()

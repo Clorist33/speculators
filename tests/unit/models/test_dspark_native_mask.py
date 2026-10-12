@@ -9,7 +9,7 @@ from speculators.models.dspark import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
 
 prediction_mask = runpy.run_path(
-    str(Path(__file__).resolve().parents[3] / 'scripts/prepare_ascendc_dspark_formal.py')
+    str(Path(__file__).resolve().parents[3] / 'scripts/prepare_ascendc_dspark_trajectory.py')
 )['prediction_mask']
 
 

@@ -710,6 +710,27 @@ def main(cfg: TrainConfig):  # noqa: C901
             )
         # A raw JSONL file cannot serve as a hidden-state cache directory.
         transfer_root = str(Path(cfg.trainer.save_path) / "trajectory_runtime")
+    elif cfg.data.data_format == "trajectory-arrow":
+        from speculators.data_generation.trajectory_cache import load_trajectory_cache
+
+        in_memory_data, train_data_ratio, data_manifest = load_trajectory_cache(
+            cfg.data.data_path,
+            model_path=cfg.verifier.verifier_name_or_path,
+            max_length=cfg.data.total_seq_len,
+            block_size=draft_model.config.block_size,
+            overlength=cfg.data.trajectory_overlength,
+            shard_names=cfg.data.trajectory_shards,
+            split_path=cfg.data.trajectory_split_path,
+            quarantine_path=cfg.data.trajectory_quarantine_path,
+        )
+        logger.info("Loaded preprocessed trajectories from %s: %s",
+                    cfg.data.data_path, data_manifest["counts"])
+        if get_rank() == 0:
+            (Path(cfg.trainer.save_path) / "trajectory_data_manifest.json").write_text(
+                json.dumps(data_manifest, ensure_ascii=False, indent=2) + "\n"
+            )
+        # Teacher hidden states belong to this run, never to the reusable dataset.
+        transfer_root = str(Path(cfg.trainer.save_path) / "trajectory_runtime")
     else:
         transfer_root = args.data_path
     transfer = backend_cls.from_train_args(args, transfer_root)

@@ -74,7 +74,8 @@ def check_config():
         errors.append('Missing teacher sharded weight index')
     raw = Path(os.environ['RAW_DATA_DIR'])
     print(f'Raw operator data: {raw} ({len(list(raw.glob("train-[0-9][0-9][0-9][0-9][0-9].jsonl")))} JSONL shards)')
-    if not list(raw.glob('train-[0-9][0-9][0-9][0-9][0-9].jsonl')):
+    if (os.environ.get('DATA_FORMAT') == 'trajectory-jsonl' and
+            not list(raw.glob('train-[0-9][0-9][0-9][0-9][0-9].jsonl'))):
         errors.append('No raw operator JSONL shards found')
     data = Path(os.environ['DATA_PATH'])
     if os.environ.get('DATA_FORMAT', 'arrow') == 'trajectory-jsonl':
@@ -91,6 +92,10 @@ def check_config():
             errors.append(f'Trajectory quarantine file missing at {quarantine}')
         if os.environ.get('TRAJECTORY_OVERLENGTH', 'error') not in ('error', 'skip', 'truncate'):
             errors.append('Invalid TRAJECTORY_OVERLENGTH')
+    elif os.environ.get('DATA_FORMAT') == 'trajectory-arrow':
+        for name in ('state.json', 'dataset_info.json', 'preprocess_manifest.json'):
+            if not (data / name).is_file():
+                errors.append(f'Prepared trajectory cache missing {name} at {data}')
     else:
         if not (data / 'state.json').is_file() or not (data / 'dataset_info.json').is_file():
             errors.append(f'Prepared trajectory Arrow Dataset missing at {data}')
@@ -166,6 +171,26 @@ def check_arrow():
     print(repr(ratio))
 
 
+def check_trajectory_cache():
+    import os
+    from speculators.data_generation.trajectory_cache import load_trajectory_cache
+
+    dataset, ratio, manifest = load_trajectory_cache(
+        os.environ['DATA_PATH'],
+        model_path=os.environ['MODEL'],
+        max_length=int(os.environ['SEQ_LENGTH']),
+        block_size=8,
+        overlength=os.environ['TRAJECTORY_OVERLENGTH'],
+        shard_names=os.environ['TRAJECTORY_SHARDS_CSV'].split(','),
+        split_path=os.environ['TRAJECTORY_SPLIT_PATH'],
+        quarantine_path=os.environ['TRAJECTORY_QUARANTINE_PATH'],
+    )
+    print(f"Trajectory cache: {len(dataset)} rows, "
+          f"train={manifest['train_rows']}, validation={manifest['validation_rows']}",
+          file=sys.stderr)
+    print(repr(ratio))
+
+
 def check_data():
     if os.environ.get('DATA_FORMAT', 'arrow') == 'trajectory-jsonl':
         # The definitive ratio is recomputed after overlength filtering in train.
@@ -186,6 +211,8 @@ def check_data():
         print(f'Trajectory shards: {len(sources)}, assigned rows: {len(assignments)}, '
               f'quarantined rows: {len(quarantined)}', file=sys.stderr)
         print(repr(ntrain / len(assignments)))
+    elif os.environ.get('DATA_FORMAT') == 'trajectory-arrow':
+        check_trajectory_cache()
     else:
         check_arrow()
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AscendC DSpark 在线训练：改下面的参数，然后直接 bash 本脚本。
-# 流程：检查原始数据 → 准备草稿配置 → 启动教师 → 内存转换轨迹并训练。
+# 流程：检查轨迹缓存 → 准备草稿配置 → 启动教师 → 读取缓存并训练。
 # 不再使用 check/smoke/train/print 参数。这里只启动训练，不重新划分原始轨迹。
 set -euo pipefail
 [[ $# == 0 ]] || { echo '请修改顶部参数；本脚本不再接受模式参数。' >&2; exit 2; }
@@ -13,14 +13,14 @@ PYTHON="python3"
 MODEL="/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16"
 DRAFT_MODEL="/home/weight/Qwen3.6-35B-A3B-Dspark"
 RAW_DATA_DIR="/home/t00972278/dataset/ascendc-kernelgen-data/dataset/agent_dataset"
-# trajectory-jsonl 直接读取原始轨迹并在内存转换；arrow 保留旧数据入口。
-DATA_FORMAT="trajectory-jsonl"
-DATA_PATH="$RAW_DATA_DIR"
+# 使用已保存的完整轨迹 Arrow 缓存；原始 JSONL 只用于构建该缓存。
+DATA_FORMAT="trajectory-arrow"
+DATA_PATH="$RAW_DATA_DIR/preprocess_data"
 TRAJECTORY_SHARDS=(train-{00000..00005}.jsonl train-{00007..00015}.jsonl) # 使用 15 个分片，留出 train-00006 做推理评估。
 TRAJECTORY_SPLIT_PATH="/home/t00972278/Dspark_sft_docs/data_split/trajectory_split.jsonl"
 TRAJECTORY_QUARANTINE_PATH="/home/t00972278/Dspark_sft_docs/data_split/quarantine.json"
 TRAJECTORY_OVERLENGTH="truncate"  # error / skip / truncate；超长轨迹截断到 SEQ_LENGTH。
-TRAIN_ROWS=""  # 仅 arrow 模式使用。
+TRAIN_ROWS=""  # 仅旧 arrow 模式使用；轨迹缓存从清单读取划分。
 
 # ============ 2. 草稿训练参数 ============
 SEQ_LENGTH="262112" # 256k 档：为额外生成 token 和 32 对齐预留空间。
@@ -28,8 +28,9 @@ EPOCHS="5"
 MAX_STEPS="0"       # 不设步数上限，完整训练 5 个 epoch。
 LR="1e-5"
 MAX_ANCHORS="256"  # 每卡每个 token 打包批次最多采样 256 个 anchor；多条轨迹共享此上限。
-NUM_WORKERS="0"     # 内存模式先避免 spawn worker 额外复制整份数据。
+NUM_WORKERS="0"     # 避免 spawn worker 额外复制整份数据。
 FSDP_SHARD="0"
+GRADIENT_CHECKPOINTING="1" # 反向传播时重算草稿层，降低 anchor 256 的激活显存。
 VLLM_NPUS="0,1,2,3" # 前 8 卡中的前 4 卡供教师使用。
 TRAIN_NPUS="4,5,6,7" # 前 8 卡中的后 4 卡供草稿训练使用。
 # 原始草稿已有 5 层、完整词表和 Markov/confidence head，训练时继续加载。
@@ -86,7 +87,7 @@ export VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_KV_CACHE_MEMORY_BYTES
 export VLLM_ENABLE_CHUNKED_PREFILL VLLM_MAX_NUM_BATCHED_TOKENS VLLM_MAX_NUM_SEQS VLLM_ENFORCE_EAGER
 export PYTHONPATH="$REPO_ROOT/hs_connectors/src:$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-# 此处检查路径和划分；训练进程启动后才在内存转换，过滤后的实际划分记入运行清单。
+# 此处检查缓存与模型、分片、划分和预处理参数是否一致。
 TRAIN_DATA_RATIO="$("$PYTHON" scripts/ascendc_dspark_launch.py check)"
 command -v setsid >/dev/null
 command -v curl >/dev/null
@@ -203,7 +204,8 @@ train_cmd=(env "ASCEND_RT_VISIBLE_DEVICES=$TRAIN_NPUS" "$PYTHON" -m torch.distri
     --checkpoint-freq 0.1
     --log-dir "$OUTPUT_DIR/logs"
     --run-name "dspark_qwen36_ascendc")
-if [[ "$DATA_FORMAT" == trajectory-jsonl ]]; then
+[[ "$GRADIENT_CHECKPOINTING" != 1 ]] || train_cmd+=(--gradient-checkpointing)
+if [[ "$DATA_FORMAT" == trajectory-jsonl || "$DATA_FORMAT" == trajectory-arrow ]]; then
     train_cmd+=(--trajectory-split-path "$TRAJECTORY_SPLIT_PATH"
         --trajectory-overlength "$TRAJECTORY_OVERLENGTH"
         --trajectory-quarantine-path "$TRAJECTORY_QUARANTINE_PATH"

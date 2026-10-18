@@ -13,6 +13,7 @@ from speculators.data_generation.trajectory import (
     inspect_trajectory_inputs,
     prepare_in_memory_trajectories,
 )
+from speculators.data_generation.trajectory_cache import load_trajectory_cache
 from speculators.train.data import ArrowDataset
 from speculators.train.dataloader import create_train_val_loaders
 from speculators.train.config import TrainConfig
@@ -200,3 +201,53 @@ def test_config_accepts_memory_flags():
     assert cfg.data.trajectory_overlength == 'skip'
     assert cfg.data.trajectory_shards == ['train-00000.jsonl', 'train-00001.jsonl']
     assert cfg.data.trajectory_quarantine_path == '/quarantine.json'
+
+
+def test_saved_trajectory_cache_reuses_rows_and_rejects_mismatches(
+    source, tokenizer, tmp_path,
+):
+    raw, split = source
+    original, ratio, manifest = prepare_in_memory_trajectories(
+        raw, split, 'unused', 128, 2, tokenizer=tokenizer,
+    )
+    cache = tmp_path / 'cache'
+    original.save_to_disk(str(cache))
+    manifest['train_ratio'] = ratio
+    manifest['saved_dataset_path'] = str(cache)
+    (cache / 'preprocess_manifest.json').write_text(json.dumps(manifest))
+
+    loaded, cached_ratio, loaded_manifest = load_trajectory_cache(
+        cache, model_path='unused', max_length=128, block_size=2,
+        overlength='error', shard_names=[raw.name], split_path=str(split),
+        tokenizer=tokenizer,
+    )
+    assert loaded.cache_files
+    assert cached_ratio == ratio
+    assert loaded_manifest['train_rows'] == 2
+    assert loaded['input_ids'] == original['input_ids']
+
+    transfer = Mock()
+    train, val = create_train_val_loaders(
+        data_path=str(cache), in_memory_data=loaded, total_seq_len=128,
+        hidden_states_dtype=torch.float32, noise_std=0, transfer=transfer,
+        vllm_endpoint='http://unused/v1', on_missing='generate', on_generate='delete',
+        verifier_name_or_path='unused', request_timeout=1, max_retries=0,
+        generation_validation_retries=0, max_consecutive_generation_failures=2,
+        hidden_size=16, num_target_layers=2, num_workers=0, prefetch_factor=2,
+        preprocess=None, train_data_ratio=cached_ratio,
+    )
+    assert len(train.dataset) == len(val.dataset) == 2
+    assert train.dataset._map_to_file_idx(0) == 0
+    assert val.dataset._map_to_file_idx(0) == 2
+
+    with pytest.raises(ValueError, match='block_size mismatch'):
+        load_trajectory_cache(
+            cache, model_path='unused', max_length=128, block_size=3,
+            overlength='error', tokenizer=tokenizer,
+        )
+    split.write_text(split.read_text() + '\n')
+    with pytest.raises(ValueError, match='split_sha256 mismatch'):
+        load_trajectory_cache(
+            cache, model_path='unused', max_length=128, block_size=2,
+            overlength='error', split_path=str(split), tokenizer=tokenizer,
+        )

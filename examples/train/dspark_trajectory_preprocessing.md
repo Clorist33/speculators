@@ -15,7 +15,7 @@ cd /home/t00972278/speculators-single-trajectory
 python3 scripts/prepare_ascendc_dspark_trajectory.py \
   --input /home/t00972278/dataset/ascendc-kernelgen-data/dataset/agent_dataset/train-00000.jsonl \
   --model /home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16 \
-  --split /home/t00972278/Dspark_sft_docs/待删除/20260929/trajectory_split.jsonl \
+  --split /home/t00972278/Dspark_sft_docs/20260929/trajectory_split.jsonl \
   --output /home/t00972278/Dspark_sft_docs/trajectory-data-new \
   --max-length 262112 --block-size 8 --overlength error
 ```

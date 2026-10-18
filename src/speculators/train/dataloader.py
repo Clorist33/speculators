@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 import os
 
 import torch
+from datasets import Dataset as HFDataset
 from torch.utils.data import DataLoader
 
 from hs_connectors import HiddenStatesTransfer
@@ -108,6 +109,7 @@ def create_train_val_loaders(
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
     max_train_batches: int | None = None,
+    in_memory_data: HFDataset | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -122,6 +124,7 @@ def create_train_val_loaders(
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
 
     train_dataset: BaseDataset = ArrowDataset(
+        in_memory_data=in_memory_data,
         datapath=data_path,
         max_len=total_seq_len,
         transfer=transfer,
@@ -139,6 +142,7 @@ def create_train_val_loaders(
         max_consecutive_generation_failures=max_consecutive_generation_failures,
     )
     val_dataset: BaseDataset = ArrowDataset(
+        in_memory_data=in_memory_data,
         datapath=data_path,
         max_len=total_seq_len,
         transfer=transfer,

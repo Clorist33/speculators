@@ -2,6 +2,8 @@ import json
 import logging
 import time
 import warnings
+from collections import deque
+from datetime import timedelta
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -113,6 +115,8 @@ _RECOVERY_SYNC_INTERVAL = 50
 
 # Bound rank skew before the validation metrics reduction.
 _VAL_SYNC_INTERVAL = 50
+_PROGRESS_LOG_INTERVAL = 5
+_PROGRESS_WINDOW_STEPS = 20
 
 
 def _should_sync_recovery(
@@ -213,6 +217,7 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.is_distributed = is_distributed()
+        self._progress_step_seconds: deque[float] = deque(maxlen=_PROGRESS_WINDOW_STEPS)
         self.resume_from_checkpoint = config.resume_from_checkpoint
         acc = torch.accelerator.current_accelerator()
         self.device_type = acc.type if acc is not None else "cuda"
@@ -481,6 +486,16 @@ class Trainer:
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
 
+        if self.rank == 0:
+            root_logger.info(
+                "Training progress: epoch %d/%d, steps %d/%d; "
+                "ETA covers training steps only",
+                epoch + 1,
+                self.config.num_epochs,
+                skip_steps,
+                num_steps,
+            )
+
         train_loader = self.train_loader
         if self.rank == 0:
             train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
@@ -494,6 +509,7 @@ class Trainer:
         timer = _StepTimer()
         recovery = BatchRecoveryCoordinator("training")
         remaining_steps = len(self.train_loader)
+        previous_step_time = time.perf_counter()
         for local_step_rel, batch in enumerate(train_loader, 1):
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
@@ -578,6 +594,48 @@ class Trainer:
                 )
             self.global_step += 1
 
+            if self.rank == 0:
+                step_finished_at = time.perf_counter()
+                self._progress_step_seconds.append(
+                    step_finished_at - previous_step_time
+                )
+                if (
+                    local_step_rel == 1
+                    or local_step % _PROGRESS_LOG_INTERVAL == 0
+                    or local_step == num_steps
+                    or will_stop
+                ):
+                    remaining_train_steps = (num_steps - local_step) + (
+                        self.config.num_epochs - epoch - 1
+                    ) * num_steps
+                    if self.config.max_steps is not None:
+                        remaining_train_steps = min(
+                            remaining_train_steps,
+                            max(0, self.config.max_steps - self.global_step),
+                        )
+                    eta = "warming up"
+                    if remaining_train_steps == 0:
+                        eta = "0:00:00"
+                    elif len(self._progress_step_seconds) >= 3:
+                        rolling_seconds = sum(self._progress_step_seconds) / len(
+                            self._progress_step_seconds
+                        )
+                        eta_seconds = round(remaining_train_steps * rolling_seconds)
+                        eta = str(timedelta(seconds=eta_seconds))
+                    root_logger.info(
+                        "PROGRESS epoch=%d/%d step=%d/%d (%.1f%%) "
+                        "global=%d/~%d eta_train=%s window=%d",
+                        epoch + 1,
+                        self.config.num_epochs,
+                        local_step,
+                        num_steps,
+                        100 * local_step / num_steps,
+                        self.global_step,
+                        self.global_step + remaining_train_steps,
+                        eta,
+                        len(self._progress_step_seconds),
+                    )
+
             if (
                 self.config.max_steps is not None
                 and self.global_step >= self.config.max_steps
@@ -592,6 +650,9 @@ class Trainer:
                 # Avoid saving back to back ay the end of each epoch
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+            if self.rank == 0:
+                # Exclude checkpoint I/O from the next training-step sample.
+                previous_step_time = time.perf_counter()
 
     def _maybe_val_sync(self, batch_index: int) -> None:
         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:

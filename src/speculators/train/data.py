@@ -7,7 +7,7 @@ from typing import Any, Literal, cast
 
 import openai
 import torch
-from datasets import load_from_disk
+from datasets import Dataset as HFDataset, load_from_disk
 from torch.utils.data import Dataset
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
@@ -169,8 +169,11 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         generation_validation_retries: int = 2,
         max_consecutive_generation_failures: int = 20,
+        in_memory_data: HFDataset | None = None,
     ):
-        self.data = load_from_disk(datapath)
+        self.data = (
+            load_from_disk(datapath) if in_memory_data is None else in_memory_data
+        )
         if not 0.0 < train_ratio <= 1.0:
             raise ValueError(f"train_ratio must be in (0.0, 1.0], got {train_ratio}")
         if split == "val" and train_ratio == 1.0:
@@ -192,6 +195,8 @@ class ArrowDataset(BaseDataset):
         # the online hidden-state path and collator require tensors.
         self.data = self.data.select(range(start, stop)).with_format("torch")
 
+        if in_memory_data is not None and transfer is None:
+            raise ValueError("In-memory data requires an explicit hidden-state transfer")
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
         self.vllm_endpoint = vllm_endpoint
         self.on_missing = on_missing

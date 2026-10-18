@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import json
 import logging
 import random
 import warnings
@@ -681,7 +682,37 @@ def main(cfg: TrainConfig):  # noqa: C901
     # is why the backend's train-args are mirrored into the pydantic schema rather
     # than the plugin depending on pydantic. test_backend_reconciliation.py keeps
     # the mirror complete so nothing read here was dropped during resolution.
-    transfer = backend_cls.from_train_args(args, args.data_path)
+    in_memory_data = None
+    train_data_ratio = cfg.data.train_data_ratio
+    if cfg.data.data_format == "trajectory-jsonl":
+        from speculators.data_generation.trajectory import (
+            prepare_in_memory_trajectories,
+        )
+
+        if cfg.speculator_type != "dspark":
+            raise ValueError("trajectory-jsonl currently supports DSpark only")
+        if not cfg.data.trajectory_split_path:
+            raise ValueError("trajectory-jsonl requires --trajectory-split-path")
+        in_memory_data, train_data_ratio, data_manifest = prepare_in_memory_trajectories(
+            cfg.data.data_path,
+            cfg.data.trajectory_split_path,
+            cfg.verifier.verifier_name_or_path,
+            cfg.data.total_seq_len,
+            draft_model.config.block_size,
+            cfg.data.trajectory_overlength,
+            shard_names=cfg.data.trajectory_shards,
+            quarantine_path=cfg.data.trajectory_quarantine_path,
+        )
+        logger.info("Prepared full trajectories in memory: %s", data_manifest["counts"])
+        if get_rank() == 0:
+            (Path(cfg.trainer.save_path) / "trajectory_data_manifest.json").write_text(
+                json.dumps(data_manifest, ensure_ascii=False, indent=2) + "\n"
+            )
+        # A raw JSONL file cannot serve as a hidden-state cache directory.
+        transfer_root = str(Path(cfg.trainer.save_path) / "trajectory_runtime")
+    else:
+        transfer_root = args.data_path
+    transfer = backend_cls.from_train_args(args, transfer_root)
 
     train_loader, val_loader = create_train_val_loaders(
         data_path=args.data_path,
@@ -702,7 +733,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
-        train_data_ratio=args.train_data_ratio,
+        train_data_ratio=train_data_ratio,
+        in_memory_data=in_memory_data,
     )
 
     # Get trainer kwargs from model class

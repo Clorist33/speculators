@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AscendC DSpark 在线训练：改下面的参数，然后直接 bash 本脚本。
-# 流程：检查已处理数据 → 准备草稿配置 → 启动教师 → 训练 → 退出时清理服务。
+# 流程：检查原始数据 → 准备草稿配置 → 启动教师 → 内存转换轨迹并训练。
 # 不再使用 check/smoke/train/print 参数。这里只启动训练，不重新划分原始轨迹。
 set -euo pipefail
 [[ $# == 0 ]] || { echo '请修改顶部参数；本脚本不再接受模式参数。' >&2; exit 2; }
@@ -13,30 +13,35 @@ PYTHON="python3"
 MODEL="/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16"
 DRAFT_MODEL="/home/weight/Qwen3.6-35B-A3B-Dspark"
 RAW_DATA_DIR="/home/t00972278/dataset/ascendc-kernelgen-data/dataset/agent_dataset"
-# 先用 prepare_ascendc_dspark_trajectory.py 生成完整轨迹 Arrow；不接受原始 JSONL。
-# 此目录尚需生成并验证，不会回退到旧的按回答展开数据。
-DATA_PATH="/home/t00972278/Dspark_sft_docs/trajectory-data-new/data_arrow"
-TRAIN_ROWS=""  # 留空则读取 Arrow/split.json。
-RUN_TIME="$(date +%Y%m%d_%H%M%S)_$$"
-LOG_ROOT="/home/t00972278/Dspark_sft_docs/train-log"
-OUTPUT_DIR="$LOG_ROOT/run_$RUN_TIME"
-# 控制台日志在预检前开始保存；运行目录由后续步骤创建。
-mkdir -p -- "$LOG_ROOT"
-exec > >(tee "$LOG_ROOT/launch_$RUN_TIME.log") 2>&1
-echo "本次输出目录：$OUTPUT_DIR"
+# trajectory-jsonl 直接读取原始轨迹并在内存转换；arrow 保留旧数据入口。
+DATA_FORMAT="trajectory-jsonl"
+DATA_PATH="$RAW_DATA_DIR"
+TRAJECTORY_SHARDS=(train-{00000..00005}.jsonl train-{00007..00015}.jsonl) # 使用 15 个分片，留出 train-00006 做推理评估。
+TRAJECTORY_SPLIT_PATH="/home/t00972278/Dspark_sft_docs/data_split/trajectory_split.jsonl"
+TRAJECTORY_QUARANTINE_PATH="/home/t00972278/Dspark_sft_docs/data_split/quarantine.json"
+TRAJECTORY_OVERLENGTH="truncate"  # error / skip / truncate；超长轨迹截断到 SEQ_LENGTH。
+TRAIN_ROWS=""  # 仅 arrow 模式使用。
 
 # ============ 2. 草稿训练参数 ============
 SEQ_LENGTH="262112" # 256k 档：为额外生成 token 和 32 对齐预留空间。
 EPOCHS="5"
 MAX_STEPS="0"       # 不设步数上限，完整训练 5 个 epoch。
 LR="1e-5"
-MAX_ANCHORS="128"  # 每卡每个打包批次最多采样 128 个 anchor。
-NUM_WORKERS="1"
+MAX_ANCHORS="256"  # 每卡每个 token 打包批次最多采样 256 个 anchor；多条轨迹共享此上限。
+NUM_WORKERS="0"     # 内存模式先避免 spawn worker 额外复制整份数据。
 FSDP_SHARD="0"
 VLLM_NPUS="0,1,2,3" # 前 8 卡中的前 4 卡供教师使用。
 TRAIN_NPUS="4,5,6,7" # 前 8 卡中的后 4 卡供草稿训练使用。
 # 原始草稿已有 5 层、完整词表和 Markov/confidence head，训练时继续加载。
 # 不设置 num-layers/draft-vocab-size，避免重新初始化或缩减词表。
+
+RUN_TIME="$(date +%Y%m%d_%H%M%S)_${#TRAJECTORY_SHARDS[@]}shards_anchor${MAX_ANCHORS}_$$"
+LOG_ROOT="/home/t00972278/Dspark_sft_docs/train-log"
+OUTPUT_DIR="$LOG_ROOT/run_$RUN_TIME"
+# 控制台日志在预检前开始保存；运行目录由后续步骤创建。
+mkdir -p -- "$LOG_ROOT"
+exec > >(tee "$LOG_ROOT/launch_$RUN_TIME.log") 2>&1
+echo "本次输出目录：$OUTPUT_DIR"
 
 # ============ 3. vLLM 教师参数（参考同事 base.sh） ============
 VLLM_PORT="8890"
@@ -72,12 +77,16 @@ VLLM_ENDPOINT="${VLLM_ENDPOINT%/}"
 read -r -a TEACHER_IDS <<< "${VLLM_NPUS//,/ }"
 read -r -a TRAIN_IDS <<< "${TRAIN_NPUS//,/ }"
 export REPO_ROOT MODEL DRAFT_MODEL RAW_DATA_DIR DATA_PATH TRAIN_DATA_PATH OUTPUT_DIR INIT_DIR
+export DATA_FORMAT TRAJECTORY_SPLIT_PATH TRAJECTORY_OVERLENGTH
+export TRAJECTORY_QUARANTINE_PATH
+TRAJECTORY_SHARDS_CSV="$(IFS=,; echo "${TRAJECTORY_SHARDS[*]}")"
+export TRAJECTORY_SHARDS_CSV
 export SEQ_LENGTH MAX_ANCHORS TRAIN_ROWS VLLM_NPUS TRAIN_NPUS LAUNCH_TEACHER
 export VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_KV_CACHE_MEMORY_BYTES
 export VLLM_ENABLE_CHUNKED_PREFILL VLLM_MAX_NUM_BATCHED_TOKENS VLLM_MAX_NUM_SEQS VLLM_ENFORCE_EAGER
 export PYTHONPATH="$REPO_ROOT/hs_connectors/src:$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-# 启动时只检查模型配置、Arrow 元数据、划分和设备冲突；不重复逐行扫描数据。
+# 此处检查路径和划分；训练进程启动后才在内存转换，过滤后的实际划分记入运行清单。
 TRAIN_DATA_RATIO="$("$PYTHON" scripts/ascendc_dspark_launch.py check)"
 command -v setsid >/dev/null
 command -v curl >/dev/null
@@ -158,10 +167,12 @@ train_cmd=(env "ASCEND_RT_VISIBLE_DEVICES=$TRAIN_NPUS" "$PYTHON" -m torch.distri
     --from-pretrained "$INIT_DIR"
     --no-resume-from-checkpoint
     --data-path "$TRAIN_DATA_PATH"
+    --data-format "$DATA_FORMAT"
     --train-data-ratio "$TRAIN_DATA_RATIO"
     --save-path "$OUTPUT_DIR/checkpoints"
     --vllm-endpoint "$VLLM_ENDPOINT"
     --hidden-states-backend file
+    --hidden-states-path "$OUTPUT_DIR/hidden_states"
     --epochs "$EPOCHS"
     --lr "$LR"
     --optimizer adamw
@@ -192,11 +203,17 @@ train_cmd=(env "ASCEND_RT_VISIBLE_DEVICES=$TRAIN_NPUS" "$PYTHON" -m torch.distri
     --checkpoint-freq 0.1
     --log-dir "$OUTPUT_DIR/logs"
     --run-name "dspark_qwen36_ascendc")
+if [[ "$DATA_FORMAT" == trajectory-jsonl ]]; then
+    train_cmd+=(--trajectory-split-path "$TRAJECTORY_SPLIT_PATH"
+        --trajectory-overlength "$TRAJECTORY_OVERLENGTH"
+        --trajectory-quarantine-path "$TRAJECTORY_QUARANTINE_PATH"
+        --trajectory-shards "${TRAJECTORY_SHARDS[@]}")
+fi
 [[ "$MAX_STEPS" == 0 ]] || train_cmd+=(--max-steps "$MAX_STEPS")
 [[ "$FSDP_SHARD" != 1 ]] || train_cmd+=(--fsdp-shard)
 printf '%q ' "${train_cmd[@]}" > "$OUTPUT_DIR/launch_command.sh.txt"
-printf 'DATA_PATH=%s\nTRAIN_DATA_PATH=%s\nTRAIN_DATA_RATIO=%s\n' \
-    "$DATA_PATH" "$TRAIN_DATA_PATH" "$TRAIN_DATA_RATIO" > "$OUTPUT_DIR/data_source.txt"
+printf 'DATA_PATH=%s\nTRAIN_DATA_PATH=%s\nTRAIN_DATA_RATIO=%s\nTRAJECTORY_SHARDS=%s\nTRAJECTORY_QUARANTINE_PATH=%s\n' \
+    "$DATA_PATH" "$TRAIN_DATA_PATH" "$TRAIN_DATA_RATIO" "$TRAJECTORY_SHARDS_CSV" "$TRAJECTORY_QUARANTINE_PATH" > "$OUTPUT_DIR/data_source.txt"
 echo "训练日志：$OUTPUT_DIR/logs/train.log"
 setsid "${train_cmd[@]}" > "$OUTPUT_DIR/logs/train.log" 2>&1 &
 TRAIN_PID=$!

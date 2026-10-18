@@ -195,6 +195,30 @@ class DraftArgs(_Group):
 
 
 class DataArgs(_Group):
+    data_format: Literal["arrow", "trajectory-jsonl"] = Field(
+        default="arrow",
+        description="Read a prepared Arrow directory, or tokenize full DSpark "
+        "trajectories from raw JSONL into memory at training startup.",
+    )
+    trajectory_split_path: str | None = Field(
+        default=None,
+        description="Source-line/group split JSONL required for trajectory-jsonl. "
+        "Its train/validation assignments take precedence over train-data-ratio.",
+    )
+    trajectory_shards: list[str] | None = Field(
+        default=None,
+        description="Explicit JSONL filenames under a trajectory-jsonl data directory. "
+        "All selected shards share one group split and are processed in memory.",
+    )
+    trajectory_quarantine_path: str | None = Field(
+        default=None,
+        description="JSON list of known invalid source IDs (e.g. 00006:691). "
+        "Only these source lines may be absent from the trajectory split.",
+    )
+    trajectory_overlength: Literal["error", "skip", "truncate"] = Field(
+        default="error",
+        description="Policy for full trajectories exceeding total-seq-len.",
+    )
     data_path: str = Field(
         default="./output",
         description="Root data directory with the preprocessed dataset, size-keyed "

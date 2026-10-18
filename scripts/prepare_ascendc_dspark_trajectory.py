@@ -2,103 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import math
-import re
 from collections import Counter
 from pathlib import Path
 
 
-CONTROL = re.compile(r'<\|im_start\|>|<\|im_end\|>')
-ASSISTANT = re.compile(r'<\|im_start\|>assistant\n(.*?)<\|im_end\|>\n', re.S)
-
-
-def normalize(example):
-    messages = copy.deepcopy(example['messages'])
-    if not messages or messages[-1]['role'] != 'assistant':
-        raise ValueError('Trajectory must end in assistant; no silent removal of trailing turns')
-    for msg in messages:
-        if msg['role'] not in ('system', 'user', 'assistant', 'tool'):
-            raise ValueError('Unsupported message role')
-        for key in ('content', 'reasoning_content'):
-            value = msg.get(key)
-            if value is not None and not isinstance(value, str):
-                raise ValueError('Only text trajectories are supported')
-        for call in msg.get('tool_calls') or []:
-            fn = call.get('function', call)
-            if not isinstance(fn.get('name'), str) or not fn['name']:
-                raise ValueError('Missing tool function name')
-            args = fn.get('arguments', {})
-            if isinstance(args, str):
-                args = json.loads(args)
-            if not isinstance(args, dict):
-                raise ValueError('Tool arguments must be a JSON object')
-            fn['arguments'] = args
-    # Structural markers in recorded text would make boundary detection ambiguous.
-    if CONTROL.search(json.dumps(messages, ensure_ascii=False)) or CONTROL.search(json.dumps(example.get('tools'), ensure_ascii=False)):
-        raise ValueError('Reserved chat delimiters inside source data')
-    return messages
-
-
-def prediction_mask(targets, block_size=8):
-    """Map token targets to DSpark next-token prediction positions."""
-    if block_size < 1 or any(x not in (0, 1) for x in targets):
-        raise ValueError('Invalid target mask or block size')
-    if not targets:
-        return []
-    mask = list(targets[1:]) + [0]
-    mask[max(0, len(mask) - block_size):] = [0] * min(block_size, len(mask))
-    return mask
-
-
-def encode_trajectory(example, tokenizer, max_length, block_size, overlength):
-    messages = normalize(example)
-    text = tokenizer.apply_chat_template(
-        messages, tools=example.get('tools'), tokenize=False,
-        add_generation_prompt=False, preserve_thinking=True,
-    )
-    spans = [(m.start(1), m.end()) for m in ASSISTANT.finditer(text)]
-    if len(spans) != sum(m['role'] == 'assistant' for m in messages):
-        raise ValueError('Unsupported chat template: assistant boundary count differs')
-    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    ids = encoded['input_ids']
-    targets = []
-    turn = 0
-    for start, end in encoded['offset_mapping']:
-        while turn < len(spans) and start >= spans[turn][1]:
-            turn += 1
-        overlap = turn < len(spans) and end > spans[turn][0] and start < spans[turn][1]
-        if overlap and not (start >= spans[turn][0] and end <= spans[turn][1]):
-            raise ValueError('Token crosses assistant boundary')
-        targets.append(int(overlap and end > start))
-    original_length = len(ids)
-    original_targets = sum(targets)
-    info = dict(original_tokens=original_length, original_target_tokens=original_targets,
-                assistant_turns=len(spans), overlength=original_length > max_length)
-    if original_length > max_length:
-        if overlength == 'error':
-            raise ValueError(f'Trajectory has {original_length} tokens, limit {max_length}')
-        if overlength == 'skip':
-            return None, dict(info, status='skipped_overlength'), text, targets
-        ids, targets = ids[:max_length], targets[:max_length]
-    mask = prediction_mask(targets, block_size)
-    info.update(retained_tokens=len(ids), retained_target_tokens=sum(targets),
-                removed_tokens=original_length-len(ids),
-                removed_target_tokens=original_targets-sum(targets),
-                prediction_candidates=sum(mask))
-    if not any(mask):
-        return None, dict(info, status='skipped_no_candidates'), text, targets
-    return dict(input_ids=ids, loss_mask=mask, seq_len=len(ids)), dict(info, status='kept'), text, targets
-
-
-def sha(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for block in iter(lambda: f.read(8*1024*1024), b''):
-            h.update(block)
-    return h.hexdigest()
+from speculators.data_generation.trajectory import (
+    encode_trajectory,
+    normalize,
+    prediction_mask,
+    sha,
+)
 
 
 def main():

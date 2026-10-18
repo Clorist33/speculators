@@ -27,10 +27,10 @@ SEQ_LENGTH="262112" # 256k 档：为额外生成 token 和 32 对齐预留空间
 EPOCHS="5"
 MAX_STEPS="0"       # 不设步数上限，完整训练 5 个 epoch。
 LR="1e-5"
-MAX_ANCHORS="256"  # 每卡每个 token 打包批次最多采样 256 个 anchor；多条轨迹共享此上限。
+MAX_ANCHORS="512"  # 每卡每个 token 打包批次最多采样 512 个 anchor；多条轨迹共享此上限。
 NUM_WORKERS="0"     # 避免 spawn worker 额外复制整份数据。
 FSDP_SHARD="0"
-GRADIENT_CHECKPOINTING="1" # 反向传播时重算草稿层，降低 anchor 256 的激活显存。
+GRADIENT_CHECKPOINTING="1" # 反向传播时重算草稿层，降低 anchor 512 的激活显存。
 VLLM_NPUS="0,1,2,3" # 前 8 卡中的前 4 卡供教师使用。
 TRAIN_NPUS="4,5,6,7" # 前 8 卡中的后 4 卡供草稿训练使用。
 # 原始草稿已有 5 层、完整词表和 Markov/confidence head，训练时继续加载。
@@ -201,7 +201,7 @@ train_cmd=(env "ASCEND_RT_VISIBLE_DEVICES=$TRAIN_NPUS" "$PYTHON" -m torch.distri
     --prefetch-factor 2
     --on-missing generate
     --on-generate delete
-    --checkpoint-freq 0.1
+    --checkpoint-eval-steps 100
     --log-dir "$OUTPUT_DIR/logs"
     --run-name "dspark_qwen36_ascendc")
 [[ "$GRADIENT_CHECKPOINTING" != 1 ]] || train_cmd+=(--gradient-checkpointing)

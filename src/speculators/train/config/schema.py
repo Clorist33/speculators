@@ -415,6 +415,14 @@ class SchedulerArgs(_Group):
 
 class TrainerArgs(_Group):
     epochs: int = Field(default=20, description="Number of training epochs.")
+    checkpoint_eval_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description="Save a separate checkpoint and run validation every N global "
+        "optimizer steps, and once at each epoch end. Checkpoints are retained "
+        "individually and the lowest validation loss points to checkpoint_best. "
+        "When set, this overrides checkpoint_freq.",
+    )
     checkpoint_freq: float = Field(
         default=1.0,
         description="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "

@@ -60,6 +60,23 @@ def test_from_sources_raises_instead_of_exiting():
         )
 
 
+def test_checkpoint_eval_steps_resolves_and_requires_positive_interval():
+    parsed = build_parser().parse_args(
+        ["--verifier-name-or-path", "m", "--checkpoint-eval-steps", "100"]
+    )
+    assert parsed.checkpoint_eval_steps == 100
+    cfg = TrainConfig.from_sources(
+        cli={"verifier_name_or_path": "m", "checkpoint_eval_steps": 100},
+        argv=["train.py"],
+    )
+    assert cfg.trainer.checkpoint_eval_steps == 100
+    with pytest.raises(ValidationError):
+        TrainConfig.from_sources(
+            cli={"verifier_name_or_path": "m", "checkpoint_eval_steps": 0},
+            argv=["train.py"],
+        )
+
+
 def test_from_sources_rejects_float16_dtype():
     # float16 needs gradient scaling, which the trainer does not implement; the
     # dtype validator rejects it at config-construction time.

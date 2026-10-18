@@ -1,6 +1,7 @@
 import functools
 import json
 import logging
+import re
 import shutil
 from abc import abstractmethod
 from pathlib import Path
@@ -64,17 +65,18 @@ class BaseCheckpointer:
             model.safetensors
             optimizer_state_dict.pt
             scheduler_state_dict.pt (optional)
+        step_00000100/ # independent step checkpoint, when enabled
+        epoch0_end/  # independent end-of-epoch checkpoint, when enabled
         ...
     """
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
-        self.previous_epoch = self._get_previous_epoch()
-
-        if self.previous_epoch != -1:
-            self.prev_path: Path | None = self.path / str(self.previous_epoch)
-        else:
-            self.prev_path = None
+        self.previous_epoch, self.previous_checkpoint = self._find_previous_checkpoint()
+        self.prev_path: Path | None = (
+            self.path / self.previous_checkpoint
+            if self.previous_checkpoint is not None else None
+        )
 
     @abstractmethod
     def load_model_state_dict(
@@ -92,7 +94,7 @@ class BaseCheckpointer:
         raise NotImplementedError
 
     def load_scheduler_state_dict(self, scheduler: SchedulerOrList):
-        scheduler_path = self.scheduler_path(self.previous_epoch)
+        scheduler_path = self.scheduler_path(self.previous_checkpoint)
         if not scheduler_path.exists():
             return
         loaded = torch.load(scheduler_path, weights_only=True)
@@ -123,43 +125,82 @@ class BaseCheckpointer:
     ):
         raise NotImplementedError
 
-    def _get_previous_epoch(self) -> int:
+    def _find_previous_checkpoint(self) -> tuple[int, str | None]:
         if not self.path.exists():
-            return -1
-        last_checkpoint_num = -1
+            return -1, None
+        latest: tuple[int, int, int] = (-1, -1, -1)
+        latest_name: str | None = None
         for d in self.path.iterdir():
-            if d.is_symlink():
-                continue  # skip descriptive symlinks like epoch0_step16626
-            if d.is_dir():
-                if d.name == "interrupted":
-                    logger.warning(
-                        f"Found interrupted checkpoint at {d}. "
-                        "To resume from it, rename it to an epoch number "
-                        "(e.g., 'mv interrupted 5' to resume as epoch 5)."
-                    )
+            if d.is_symlink() or not d.is_dir():
+                continue
+            if d.name == "interrupted":
+                logger.warning(
+                    f"Found interrupted checkpoint at {d}. "
+                    "To resume from it, rename it to an epoch number "
+                    "(e.g., 'mv interrupted 5' to resume as epoch 5)."
+                )
+                continue
+            state_path = d / "training_state.json"
+            try:
+                state = json.loads(state_path.read_text())
+            except (OSError, ValueError):
+                state = None
+            if not isinstance(state, dict):
+                state = None
+            if d.name.isdigit():
+                epoch = int(d.name)
+                # Legacy epoch checkpoints may predate training_state.json.
+                completed = int(not state or state.get("local_step", 0) == 0)
+                global_step = state.get("global_step", 0) if state else 0
+                if not isinstance(global_step, int):
                     continue
-                try:
-                    last_checkpoint_num = max(last_checkpoint_num, int(d.name))
-                except ValueError:
+            elif re.fullmatch(r"step_\d+", d.name) and isinstance(state, dict):
+                epoch = state.get("epoch")
+                completed = 0
+                global_step = state.get("global_step")
+                if (
+                    not isinstance(epoch, int)
+                    or not isinstance(global_step, int)
+                    or not isinstance(state.get("local_step"), int)
+                    or state["local_step"] <= 0
+                    or int(d.name.removeprefix("step_")) != global_step
+                ):
                     continue
-        return last_checkpoint_num
+            elif re.fullmatch(r"epoch\d+_end", d.name) and isinstance(state, dict):
+                epoch = state.get("epoch")
+                completed = 1
+                global_step = state.get("global_step")
+                if (
+                    not isinstance(epoch, int)
+                    or not isinstance(global_step, int)
+                    or state.get("local_step") != 0
+                    or int(d.name.removeprefix("epoch").removesuffix("_end")) != epoch
+                ):
+                    continue
+            else:
+                continue
+            key = (epoch, completed, global_step)
+            if key > latest:
+                latest = key
+                latest_name = d.name
+        return latest[0], latest_name
 
-    def model_path(self, epoch: int | str):
+    def model_path(self, epoch: int | str | None):
         model_fname = "model.safetensors"
         return self.path / str(epoch) / model_fname
 
-    def optimizer_path(self, epoch: int | str):
+    def optimizer_path(self, epoch: int | str | None):
         optimizer_fname = "optimizer_state_dict.pt"
         return self.path / str(epoch) / optimizer_fname
 
-    def scheduler_path(self, epoch: int | str):
+    def scheduler_path(self, epoch: int | str | None):
         scheduler_fname = "scheduler_state_dict.pt"
         return self.path / str(epoch) / scheduler_fname
 
     def best_path(self) -> Path:
         return self.path / "checkpoint_best"
 
-    def val_metrics_path(self, epoch: int) -> Path:
+    def val_metrics_path(self, epoch: int | str) -> Path:
         return self.path / str(epoch) / "val_metrics.json"
 
     TRAIN_COMMAND_FILENAME = "train_command.txt"
@@ -170,16 +211,16 @@ class BaseCheckpointer:
             shutil.copy2(src, self.path / str(epoch) / self.TRAIN_COMMAND_FILENAME)
 
     @_rank0_only
-    def save_val_metrics(self, epoch: int, val_metrics: dict[str, float]):
+    def save_val_metrics(self, epoch: int | str, val_metrics: dict[str, float]):
         path = self.val_metrics_path(epoch)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(val_metrics))
 
     def load_best_val_loss(self) -> float | None:
-        best_epoch = self.read_best_epoch()
-        if best_epoch is None:
+        best_checkpoint = self.read_best_checkpoint()
+        if best_checkpoint is None:
             return None
-        p = self.val_metrics_path(best_epoch)
+        p = self.val_metrics_path(best_checkpoint)
         if not p.exists():
             return None
         try:
@@ -188,8 +229,8 @@ class BaseCheckpointer:
         except (json.JSONDecodeError, KeyError, ValueError, TypeError):
             return None
 
-    def read_best_epoch(self) -> int | None:
-        """Return the epoch that `checkpoint_best` points to."""
+    def read_best_checkpoint(self) -> str | None:
+        """Return the checkpoint directory that `checkpoint_best` points to."""
         best_path = self.best_path()
         if not best_path.exists() or not best_path.is_symlink():
             return None
@@ -197,24 +238,30 @@ class BaseCheckpointer:
             target = best_path.readlink()
         except OSError:
             return None
-        try:
-            return int(Path(target).name)
-        except ValueError:
-            return None
+        name = Path(target).name
+        return name if name and (self.path / name).is_dir() else None
+
+    def read_best_epoch(self) -> int | None:
+        """Return the epoch number for a legacy epoch checkpoint, if any."""
+        name = self.read_best_checkpoint()
+        return int(name) if name is not None and name.isdigit() else None
 
     def load_model_state_dict_for_epoch(
         self, model: PreTrainedModel, epoch: int, float_dtype: torch.dtype | None = None
     ):
         """Temporarily load weights for a specific epoch."""
         old_epoch = self.previous_epoch
+        old_checkpoint = self.previous_checkpoint
         try:
             self.previous_epoch = epoch
+            self.previous_checkpoint = str(epoch)
             self.load_model_state_dict(model, float_dtype=float_dtype)
         finally:
             self.previous_epoch = old_epoch
+            self.previous_checkpoint = old_checkpoint
 
     @_rank0_only
-    def update_best_symlink(self, epoch: int):
+    def update_best_symlink(self, epoch: int | str):
         best_path = self.best_path()
         target = Path(str(epoch))  # relative symlink inside checkpoint root
 
@@ -305,7 +352,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     ):
         device = get_current_device()
         full_state_dict = load_safetensors_state_dict(
-            self.model_path(self.previous_epoch),
+            self.model_path(self.previous_checkpoint),
             device,
         )
         full_state_dict = convert_float_dtype(
@@ -322,7 +369,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
     ):
         device = get_current_device()
         loaded = torch.load(
-            self.optimizer_path(self.previous_epoch),
+            self.optimizer_path(self.previous_checkpoint),
             weights_only=True,
             map_location=device,
         )
@@ -365,7 +412,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
         full_state_dict = load_safetensors_state_dict(
-            self.model_path(self.previous_epoch), "cpu"
+            self.model_path(self.previous_checkpoint), "cpu"
         )
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
@@ -389,7 +436,7 @@ class DistributedCheckpointer(BaseCheckpointer):
     ):
         optimizers = _as_list(optimizer)
         full_state_dict = torch.load(
-            self.optimizer_path(self.previous_epoch),
+            self.optimizer_path(self.previous_checkpoint),
             mmap=True,
             weights_only=True,
             map_location="cpu",

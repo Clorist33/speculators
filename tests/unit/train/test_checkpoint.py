@@ -1,7 +1,10 @@
+import json
 import os
 import signal
+from collections import deque
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -46,6 +49,126 @@ def test_previous_epoch_ignores_checkpoint_best(tmp_path: Path):
 
     cp = SingleGPUCheckpointer(str(tmp_path))
     assert cp.previous_epoch == 2
+
+
+def test_step_checkpoints_are_independent_and_best_is_retained(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=1, save_best=False)
+    trainer.config = trainer.config._replace(checkpoint_eval_steps=100)
+    trainer.model = cast("SpeculatorModel", Mock())
+    losses = iter((0.8, 0.3, 0.5))
+    trainer.val_epoch = lambda _epoch: {"loss_epoch": next(losses)}
+    saved: list[str] = []
+
+    def fake_save(_model, _optimizer, name: str):
+        saved.append(name)
+        (tmp_path / name).mkdir()
+
+    monkeypatch.setattr(trainer.checkpointer, "save_checkpoint", fake_save)
+
+    for step, local_step, name in (
+        (100, 100, "step_00000100"),
+        (200, 200, "step_00000200"),
+        (250, 0, "epoch0_end"),
+    ):
+        trainer.global_step = step
+        trainer._save_and_validate(0, local_step, name)
+        assert (tmp_path / name / "val_metrics.json").exists()
+
+    assert saved == ["step_00000100", "step_00000200", "epoch0_end"]
+    assert (tmp_path / "checkpoint_best").resolve() == (
+        tmp_path / "step_00000200"
+    ).resolve()
+    assert trainer.best_val_loss == 0.3
+
+    cp = SingleGPUCheckpointer(tmp_path)
+    assert cp.previous_epoch == 0
+    assert cp.previous_checkpoint == "epoch0_end"
+    assert cp.load_best_val_loss() == 0.3
+
+    with pytest.raises(FileExistsError, match="step_00000100"):
+        trainer.maybe_save_checkpoint(0, 100, "step_00000100")
+
+
+def test_step_checkpoint_resume_uses_latest_completed_step(tmp_path: Path):
+    for step in (100, 200):
+        checkpoint = tmp_path / f"step_{step:08d}"
+        checkpoint.mkdir()
+        (checkpoint / "training_state.json").write_text(json.dumps({
+            "epoch": 0, "local_step": step, "global_step": step,
+        }))
+    # A partially written checkpoint must not displace the last usable one.
+    (tmp_path / "step_00000300").mkdir()
+
+    cp = SingleGPUCheckpointer(tmp_path)
+    assert cp.previous_checkpoint == "step_00000200"
+    trainer = Trainer.__new__(Trainer)
+    trainer.resume_from_checkpoint = True
+    trainer.checkpointer = cp
+    trainer.setup_trainer()
+    assert trainer.current_epoch == 0
+    assert trainer._resume_local_step == 200
+    assert trainer.global_step == 200
+
+
+def test_checkpoint_eval_due_every_100_global_steps(tmp_path: Path):
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=1, save_best=False)
+    trainer.config = trainer.config._replace(checkpoint_eval_steps=100)
+    for step, expected in ((0, False), (99, False), (100, True),
+                           (101, False), (200, True)):
+        trainer.global_step = step
+        assert trainer._checkpoint_eval_due() is expected
+
+
+def test_train_loop_saves_then_validates_each_interval_and_epoch_end(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, document_ids, error_records):
+            return None, self.weight * document_ids.float().sum(), {}
+
+    trainer = _make_minimal_trainer(tmp_path, checkpoint_freq=1, save_best=False)
+    trainer.config = trainer.config._replace(num_epochs=1, checkpoint_eval_steps=2)
+    trainer.model = cast("SpeculatorModel", TinyModel())
+    trainer.optimizers = [torch.optim.SGD(trainer.model.parameters(), lr=0.01)]
+    trainer.train_loader = DataLoader(
+        [{"document_ids": torch.tensor([1]), "error_records": 0}] * 4,
+        batch_size=None,
+    )
+    trainer.val_loader = trainer.train_loader
+    trainer.device_type = "cpu"
+    trainer.local_rank = "cpu"
+    trainer._progress_step_seconds = deque(maxlen=10)
+    events: list[str] = []
+
+    def fake_save(_model, _optimizer, name: str):
+        events.append(f"save:{name}")
+        (tmp_path / name).mkdir()
+
+    def fake_val(_epoch: int):
+        events.append("validate")
+        trainer.model.eval()
+        return {"loss_epoch": float(4 - trainer.global_step)}
+
+    trainer.val_epoch = fake_val
+    monkeypatch.setattr(trainer.checkpointer, "save_checkpoint", fake_save)
+
+    trainer.run_training()
+
+    assert events == [
+        "save:step_00000002", "validate",
+        "save:step_00000004", "validate",
+        "save:epoch0_end", "validate",
+    ]
+    assert trainer.model.training
+    assert (tmp_path / "checkpoint_best").resolve() == (
+        tmp_path / "step_00000004"
+    ).resolve()
 
 
 def test_update_best_symlink_creates_and_updates(tmp_path: Path):

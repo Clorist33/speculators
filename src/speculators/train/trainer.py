@@ -152,6 +152,7 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
+    checkpoint_eval_steps: int | None = None
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
@@ -210,6 +211,10 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader | None = None,
     ):
+        if config.checkpoint_eval_steps is not None and config.save_best:
+            raise ValueError("checkpoint_eval_steps requires save_best=False")
+        if config.checkpoint_eval_steps is not None and val_loader is None:
+            raise ValueError("checkpoint_eval_steps requires a validation loader")
         self.model = model
         self.config = config
         self.local_rank = get_local_rank()
@@ -232,23 +237,24 @@ class Trainer:
         self.setup_model()
         self.setup_optimizer()
 
-    def _training_state_path(self, epoch: int) -> Path:
-        return self.checkpointer.path / str(epoch) / "training_state.json"
+    def _training_state_path(self, checkpoint: int | str) -> Path:
+        return self.checkpointer.path / str(checkpoint) / "training_state.json"
 
-    def _save_training_state(self, epoch: int, local_step: int) -> None:
+    def _save_training_state(
+        self, epoch: int, local_step: int, checkpoint: int | str | None = None
+    ) -> None:
         if not self.is_distributed or dist.get_rank() == 0:
             state = {
                 "epoch": epoch,
                 "local_step": local_step,
                 "global_step": self.global_step,
             }
-            p = self._training_state_path(epoch)
+            p = self._training_state_path(epoch if checkpoint is None else checkpoint)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(state))
 
     def _load_training_state(self) -> dict:
-        epoch = self.checkpointer.previous_epoch
-        p = self._training_state_path(epoch)
+        p = self._training_state_path(self.checkpointer.previous_checkpoint)
         if p.exists():
             try:
                 return json.loads(p.read_text())
@@ -475,6 +481,14 @@ class Trainer:
             )
         return skip_steps
 
+    def _checkpoint_eval_due(self) -> bool:
+        interval = self.config.checkpoint_eval_steps
+        return (
+            interval is not None
+            and self.global_step > 0
+            and self.global_step % interval == 0
+        )
+
     def train_epoch(self, epoch: int):
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
@@ -502,7 +516,8 @@ class Trainer:
 
         step_interval = (
             max(1, round(num_steps * self.config.checkpoint_freq))
-            if self.config.checkpoint_freq < 1
+            if self.config.checkpoint_eval_steps is None
+            and self.config.checkpoint_freq < 1
             else None
         )
         t_before_fetch = time.perf_counter()
@@ -636,14 +651,13 @@ class Trainer:
                         len(self._progress_step_seconds),
                     )
 
-            if (
-                self.config.max_steps is not None
-                and self.global_step >= self.config.max_steps
-            ):
-                break
-
-            if (
-                step_interval is not None
+            if self._checkpoint_eval_due():
+                self._save_and_validate(
+                    epoch, local_step, f"step_{self.global_step:08d}"
+                )
+            elif (
+                not will_stop
+                and step_interval is not None
                 and not self.config.save_best
                 and local_step % step_interval == 0
                 and num_steps - local_step >= step_interval * MIN_STEP_PCT
@@ -653,6 +667,11 @@ class Trainer:
             if self.rank == 0:
                 # Exclude checkpoint I/O from the next training-step sample.
                 previous_step_time = time.perf_counter()
+            if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                break
 
     def _maybe_val_sync(self, batch_index: int) -> None:
         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
@@ -715,8 +734,13 @@ class Trainer:
 
         return val_metrics
 
-    def maybe_save_checkpoint(self, epoch: int | str, local_step: int = 0):
-        if epoch != "interrupted" and (
+    def maybe_save_checkpoint(
+        self,
+        epoch: int | str,
+        local_step: int = 0,
+        checkpoint_name: str | None = None,
+    ):
+        if checkpoint_name is None and epoch != "interrupted" and (
             self.config.save_best
             or (
                 self.config.checkpoint_freq >= 1
@@ -727,15 +751,25 @@ class Trainer:
         ):
             return
 
-        root_logger.info(f"Saving checkpoint to {self.checkpointer.path / str(epoch)}")
-        self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
+        target = checkpoint_name if checkpoint_name is not None else epoch
+        if checkpoint_name is not None:
+            target_path = self.checkpointer.path / checkpoint_name
+            exists = [target_path.exists() if self.rank == 0 else None]
+            if self.is_distributed:
+                dist.broadcast_object_list(exists, src=0)
+            if exists[0]:
+                raise FileExistsError(f"Checkpoint already exists: {target_path}")
+        root_logger.info(f"Saving checkpoint to {self.checkpointer.path / str(target)}")
+        self.checkpointer.save_checkpoint(self.model, self.optimizers, target)
         if self.schedulers:
-            self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+            self.checkpointer.save_scheduler_state_dict(self.schedulers, target)
         if isinstance(epoch, int):
-            self._save_training_state(epoch, local_step)
+            self._save_training_state(epoch, local_step, target)
             # Create a human-readable symlink for checkpoint readability.
             # e.g. epoch0_step16626 -> 0/ (mid) or epoch0_end -> 0/ (end)
-            if not self.is_distributed or dist.get_rank() == 0:
+            if checkpoint_name is None and (
+                not self.is_distributed or dist.get_rank() == 0
+            ):
                 ckpt_dir = self.checkpointer.path
                 suffix = f"step{local_step}" if local_step > 0 else "end"
                 link_name = ckpt_dir / f"epoch{epoch}_{suffix}"
@@ -745,9 +779,9 @@ class Trainer:
                     if old.is_symlink():
                         old.unlink()
                 link_name.symlink_to(target)
-        root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
+        root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(target)}")
 
-    def maybe_update_best(self, epoch: int, val_metrics: dict | None):
+    def maybe_update_best(self, epoch: int | str, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:
             return
         if val_metrics["loss_epoch"] >= self.best_val_loss:
@@ -757,7 +791,7 @@ class Trainer:
             self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
             if self.schedulers:
                 self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
-        elif self.config.checkpoint_freq >= 1 and not (
+        elif isinstance(epoch, int) and self.config.checkpoint_freq >= 1 and not (
             epoch == 0 or (epoch + 1) % int(self.config.checkpoint_freq) == 0
         ):
             return
@@ -771,6 +805,32 @@ class Trainer:
         if self.config.save_best:
             self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
 
+    def _save_and_validate(
+        self, epoch: int, local_step: int, checkpoint_name: str
+    ) -> None:
+        self.maybe_save_checkpoint(
+            epoch, local_step=local_step, checkpoint_name=checkpoint_name
+        )
+        if self.is_distributed:
+            dist.barrier()
+        root_logger.info(
+            "Validation for %s at global step %d started",
+            checkpoint_name,
+            self.global_step,
+        )
+        try:
+            val_metrics = self.val_epoch(epoch)
+        finally:
+            self.model.train()
+        root_logger.info("Validation for %s completed", checkpoint_name)
+        if self.is_distributed:
+            dist.barrier()
+        if val_metrics is not None:
+            self.checkpointer.save_val_metrics(checkpoint_name, val_metrics)
+        self.maybe_update_best(checkpoint_name, val_metrics)
+        if self.is_distributed:
+            dist.barrier()
+
     @with_graceful_shutdown()
     def run_training(self):
         n_epochs = self.config.num_epochs
@@ -782,24 +842,27 @@ class Trainer:
             if self.is_distributed:
                 dist.barrier()
 
-            self.maybe_save_checkpoint(epoch)
-
-            if self.is_distributed:
-                dist.barrier()
-
-            val_metrics = None
-
-            if self.val_loader is None:
-                root_logger.warning("No val loader, skipping validation epoch")
+            if self.config.checkpoint_eval_steps is not None:
+                self._save_and_validate(epoch, 0, f"epoch{epoch}_end")
             else:
-                root_logger.info(f"Validation epoch {epoch + 1}/{n_epochs} started")
-                val_metrics = self.val_epoch(epoch)
-                root_logger.info(f"Validation epoch {epoch + 1}/{n_epochs} completed")
+                self.maybe_save_checkpoint(epoch)
 
-            if self.is_distributed:
-                dist.barrier()
+                if self.is_distributed:
+                    dist.barrier()
 
-            self.maybe_update_best(epoch, val_metrics)
+                val_metrics = None
+
+                if self.val_loader is None:
+                    root_logger.warning("No val loader, skipping validation epoch")
+                else:
+                    root_logger.info(f"Validation epoch {epoch + 1}/{n_epochs} started")
+                    val_metrics = self.val_epoch(epoch)
+                    root_logger.info(f"Validation epoch {epoch + 1}/{n_epochs} completed")
+
+                if self.is_distributed:
+                    dist.barrier()
+
+                self.maybe_update_best(epoch, val_metrics)
 
             if self.is_distributed:
                 dist.barrier()

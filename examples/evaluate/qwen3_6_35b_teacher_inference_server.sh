@@ -6,11 +6,19 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 set -euo pipefail
 
 MODEL="${MODEL:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}"
-LOG="${LOG:-/home/t00972278/speculators/examples/evaluate/teacher_inference.log}"
+LOG_ROOT="${LOG_ROOT:-/home/t00972278/Dspark_sft_docs/rllout性能/时间对比}"
 PORT="${PORT:-19096}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 
 [[ -f "$MODEL/config.json" ]] || { echo "Missing model config: $MODEL/config.json" >&2; exit 1; }
-mkdir -p -- "$(dirname -- "$LOG")"
+if [[ -n "${LOG:-}" ]]; then
+    mkdir -p -- "$(dirname -- "$LOG")"
+else
+    mkdir -p -- "$LOG_ROOT"
+    RUN_DIR="$(mktemp -d -- "$LOG_ROOT/teacher_$(date -u +%Y%m%d_%H%M%S)_XXXXXX")"
+    LOG="$RUN_DIR/server.log"
+fi
+printf 'vLLM server log: %s\n' "$LOG"
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-12,13}"
 export ENABLE_MEGAKERNEL=0
@@ -40,7 +48,7 @@ vllm serve "$MODEL" \
     --tensor-parallel-size 2 \
     --data-parallel-size 1 \
     --max-model-len 262144 \
-    --max-num-seqs 4 \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.90 \
     --safetensors-load-strategy prefetch \

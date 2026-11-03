@@ -9,10 +9,21 @@ ROOT=/workspace/vllm-ascend
 
 MODEL=/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16
 DRAFT="${DRAFT:-/home/weight/Qwen3.6-35B-A3B-Dspark}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-8}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+CUDAGRAPH_REQUIRED_SIZE=$(( MAX_NUM_SEQS * (NUM_SPECULATIVE_TOKENS + 1) ))
+CUDAGRAPH_CAPTURE_SIZE=$(( (CUDAGRAPH_REQUIRED_SIZE + 7) / 8 * 8 ))
+CUDAGRAPH_CAPTURE_SIZES='[1,2,4'
+for ((capture_size = 8; capture_size <= CUDAGRAPH_CAPTURE_SIZE; capture_size += 8)); do
+    CUDAGRAPH_CAPTURE_SIZES+=",$capture_size"
+done
+if (( CUDAGRAPH_REQUIRED_SIZE % 8 != 0 )); then
+    CUDAGRAPH_CAPTURE_SIZES+=",$CUDAGRAPH_REQUIRED_SIZE"
+fi
+CUDAGRAPH_CAPTURE_SIZES+=']'
 
 
-#LOG="${LOG:-/home/t00972278/speculators/examples/evaluate/dspark_inference_no_prefix_cache.log}"
-LOG="${LOG:-/home/t00972278/111111.log}"
+LOG_ROOT="${LOG_ROOT:-/home/t00972278/Dspark_sft_docs/rllout性能/时间对比}"
 PORT="${PORT:-9092}"
 # EXPECTED_VLLM=ba07e4a48fc951300d97eb506217dd530583dea3
 
@@ -38,8 +49,6 @@ PORT="${PORT:-9092}"
 # ln -sfn "$BINARY_ROOT/vllm_ascend/_cann_ops_custom/vendors" \
 #     "$ASCEND_ROOT/vllm_ascend/_cann_ops_custom/vendors"
 
-# mkdir -p "$(dirname "$LOG")"
-
 # # ============================================================
 # # 环境加载
 # # ============================================================
@@ -51,12 +60,21 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 set -eo pipefail
 set -u
 
+if [[ -n "${LOG:-}" ]]; then
+    mkdir -p -- "$(dirname -- "$LOG")"
+else
+    mkdir -p -- "$LOG_ROOT"
+    RUN_DIR="$(mktemp -d -- "$LOG_ROOT/dspark_$(date -u +%Y%m%d_%H%M%S)_XXXXXX")"
+    LOG="$RUN_DIR/server.log"
+fi
+printf 'vLLM server log: %s\n' "$LOG"
+
 
 # ============================================================
 # 环境变量
 # ============================================================
 # export PYTHONPATH="$VLLM_ROOT:$ASCEND_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-12,13}"
 
 export ENABLE_MEGAKERNEL=0
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -101,7 +119,7 @@ vllm serve "$MODEL" \
     --tensor-parallel-size 2 \
     --data-parallel-size 1 \
     --max-model-len 262144 \
-    --max-num-seqs 4 \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.90 \
     --safetensors-load-strategy prefetch \
@@ -109,7 +127,7 @@ vllm serve "$MODEL" \
     --async-scheduling \
     --trust-remote-code \
     --api-server-count 1 \
-    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"max_cudagraph_capture_size\":$CUDAGRAPH_CAPTURE_SIZE,\"cudagraph_capture_sizes\":$CUDAGRAPH_CAPTURE_SIZES}" \
     --generation-config vllm \
     --additional-config '{
         "enable_cpu_binding": true,
@@ -119,7 +137,7 @@ vllm serve "$MODEL" \
     --speculative-config "{
         \"method\": \"dspark\",
         \"model\": \"$DRAFT\",
-        \"num_speculative_tokens\": 8,
+        \"num_speculative_tokens\": $NUM_SPECULATIVE_TOKENS,
         \"enforce_eager\": false
     }" \
     2>&1 | tee "$LOG"

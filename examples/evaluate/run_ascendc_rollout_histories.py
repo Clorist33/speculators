@@ -96,8 +96,8 @@ def main():
 
     with args.input.open(encoding="utf-8") as source:
         samples = json.load(source)
-    if not isinstance(samples, list) or len(samples) != 153:
-        raise ValueError("Expected 153 cumulative history samples in a JSON array")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("Expected a nonempty JSON array of cumulative history samples")
     if any(sample["sample_index"] != i for i, sample in enumerate(samples)):
         raise ValueError("Sample indices are not contiguous")
 

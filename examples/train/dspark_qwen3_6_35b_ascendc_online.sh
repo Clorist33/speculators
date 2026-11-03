@@ -12,7 +12,7 @@ REPO_ROOT="$PWD"
 PYTHON="python3"
 MODEL="/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16"
 DRAFT_MODEL="/home/weight/Qwen3.6-35B-A3B-Dspark"
-RAW_DATA_DIR="/home/t00972278/dataset/ascendc-kernelgen-data/dataset/agent_dataset"
+RAW_DATA_DIR="/home/dataset/ascendc-kernelgen-data/dataset/agent_dataset"
 # 使用已保存的完整轨迹 Arrow 缓存；原始 JSONL 只用于构建该缓存。
 DATA_FORMAT="trajectory-arrow"
 DATA_PATH="$RAW_DATA_DIR/preprocess_data"
@@ -23,21 +23,22 @@ TRAJECTORY_OVERLENGTH="truncate"  # error / skip / truncate；超长轨迹截断
 TRAIN_ROWS=""  # 仅旧 arrow 模式使用；轨迹缓存从清单读取划分。
 
 # ============ 2. 草稿训练参数 ============
-SEQ_LENGTH="512000" # 256k 档：为额外生成 token 和 32 对齐预留空间。
-EPOCHS="5"
-MAX_STEPS="0"       # 不设步数上限，完整训练 5 个 epoch。
+SEQ_LENGTH="262112" # 256k 档：为额外生成 token 和 32 对齐预留空间。
+EPOCHS="2"
+MAX_STEPS="0"       # 不设步数上限，完整训练 EPOCHS 个 epoch。
 LR="1e-5"
-MAX_ANCHORS="1024"  # 每卡每个 token 打包批次最多采样 512 个 anchor；多条轨迹共享此上限。
+MAX_ANCHORS="1024"  # 每卡每个 token 打包批次最多采样 1024 个 anchor；多条轨迹共享此上限。
 NUM_WORKERS="0"     # 避免 spawn worker 额外复制整份数据。
 FSDP_SHARD="0"
-GRADIENT_CHECKPOINTING="1" # 反向传播时重算草稿层，降低 anchor 512 的激活显存。
-VLLM_NPUS="0,1,2,3" # 前 8 卡中的前 4 卡供教师使用。
-TRAIN_NPUS="4,5,6,7,8,9,10,11" # 前 8 卡中的后 4 卡供草稿训练使用。
+GRADIENT_CHECKPOINTING="1" # 反向传播时重算草稿层，降低 anchor 1024 的激活显存。
+VLLM_NPUS="0,1,2,3" # 教师 TP=4。
+TRAIN_NPUS="4,5,6,7,8,9,10,11" # 草稿 DP=8；与教师卡不重叠。
+HCCL_INTRA_ROCE_ENABLE="1" # 训练卡跨 NPU 模块时启用跨模块通信。
 # 原始草稿已有 5 层、完整词表和 Markov/confidence head，训练时继续加载。
 # 不设置 num-layers/draft-vocab-size，避免重新初始化或缩减词表。
 
 RUN_TIME="$(date +%Y%m%d_%H%M%S)_${#TRAJECTORY_SHARDS[@]}shards_anchor${MAX_ANCHORS}_$$"
-LOG_ROOT="/home/t00972278/Dspark_sft_docs/train-log"
+LOG_ROOT="/Dspark_sft_docs/train-log"
 OUTPUT_DIR="$LOG_ROOT/run_$RUN_TIME"
 # 控制台日志在预检前开始保存；运行目录由后续步骤创建。
 mkdir -p -- "$LOG_ROOT"
@@ -161,7 +162,7 @@ else
 fi
 
 # ============ 6. 训练草稿 ============
-train_cmd=(env "ASCEND_RT_VISIBLE_DEVICES=$TRAIN_NPUS" "$PYTHON" -m torch.distributed.run
+train_cmd=(env "ASCEND_RT_VISIBLE_DEVICES=$TRAIN_NPUS" "HCCL_INTRA_ROCE_ENABLE=$HCCL_INTRA_ROCE_ENABLE" "$PYTHON" -m torch.distributed.run
     --standalone
     --nproc_per_node "${#TRAIN_IDS[@]}" -m speculators.train
     --verifier-name-or-path "$MODEL"

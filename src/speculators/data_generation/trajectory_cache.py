@@ -44,7 +44,10 @@ def load_trajectory_cache(
     require("data_format", "trajectory-jsonl")
     require("model_path", model_path)
     require("max_length", max_length)
-    require("block_size", block_size)
+    # An 8-slot cache masks the final eight positions of each trajectory, so
+    # 4-slot training can reuse it with a conservative loss mask.
+    if (block_size, manifest.get("block_size")) != (4, 8):
+        require("block_size", block_size)
     require("overlength", overlength)
     require("preprocessing_sha256", trajectory.sha(trajectory.__file__))
     if shard_names is not None:

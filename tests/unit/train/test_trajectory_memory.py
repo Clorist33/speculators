@@ -251,3 +251,29 @@ def test_saved_trajectory_cache_reuses_rows_and_rejects_mismatches(
             cache, model_path='unused', max_length=128, block_size=2,
             overlength='error', split_path=str(split), tokenizer=tokenizer,
         )
+
+
+def test_eight_slot_cache_can_load_for_four_slot_training(source, tokenizer, tmp_path):
+    raw, split = source
+    original, ratio, manifest = prepare_in_memory_trajectories(
+        raw, split, 'unused', 128, 8, tokenizer=tokenizer,
+    )
+    cache = tmp_path / 'cache8'
+    original.save_to_disk(str(cache))
+    manifest['train_ratio'] = ratio
+    manifest['saved_dataset_path'] = str(cache)
+    (cache / 'preprocess_manifest.json').write_text(json.dumps(manifest))
+
+    loaded, cached_ratio, loaded_manifest = load_trajectory_cache(
+        cache, model_path='unused', max_length=128, block_size=4,
+        overlength='error', tokenizer=tokenizer,
+    )
+    assert cached_ratio == ratio
+    assert loaded_manifest['block_size'] == 8
+    assert loaded['loss_mask'] == original['loss_mask']
+
+    with pytest.raises(ValueError, match='block_size mismatch'):
+        load_trajectory_cache(
+            cache, model_path='unused', max_length=128, block_size=2,
+            overlength='error', tokenizer=tokenizer,
+        )

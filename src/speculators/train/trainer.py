@@ -561,7 +561,13 @@ class Trainer:
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            if (self.config.train_call_kwargs or {}).get(
+                "per_position_loss_weight"
+            ) == "vat":
+                # clip_grad_norm_ returns the norm before clipping.
+                metrics["grad_norm_sum"] = grad_norm.detach().float()
+                metrics["grad_norm_total"] = torch.ones_like(metrics["grad_norm_sum"])
 
             metrics["error_records_sum"] = torch.tensor(
                 batch["error_records"], dtype=torch.float32, device=loss.device

@@ -1,6 +1,7 @@
 """Shared loss selection, weighting, and reduction utilities."""
 
 import json
+import math
 from collections.abc import Callable
 
 import torch
@@ -110,6 +111,50 @@ def dpace_loss_decay(
 
     # reshape weight
     return weight.reshape(1, -1)
+
+
+@torch.no_grad()
+def vat_loss_decay(
+    pred_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    gamma: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Re-anchor DSpark's decay at each block's first greedy mismatch.
+
+    Only the contiguous valid prefix from slot 0 represents one verification
+    attempt. Valid slots after a mask gap retain the original fixed decay.
+    Returns flattened weights, first mismatch (``block_size`` if absent), and
+    the per-block valid-prefix mask. The loss reducer still divides by the
+    number of valid slots, rather than by the sum of these weights.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if not math.isfinite(gamma) or gamma <= 0:
+        raise ValueError(f"gamma must be positive and finite, got {gamma}")
+    if pred_ids.ndim != 2 or pred_ids.shape != target_ids.shape:
+        raise ValueError("pred_ids and target_ids must have the same [1, T] shape")
+    if pred_ids.shape != loss_mask.shape or pred_ids.shape[0] != 1:
+        raise ValueError("loss_mask must have the same [1, T] shape as pred_ids")
+    if pred_ids.shape[1] % block_size:
+        raise ValueError("sequence length must be divisible by block_size")
+
+    num_blocks = pred_ids.shape[1] // block_size
+    valid = loss_mask.reshape(num_blocks, block_size).bool()
+    prefix_valid = valid.to(torch.int32).cumprod(dim=-1).bool()
+    mismatch = prefix_valid & (
+        pred_ids.reshape(num_blocks, block_size)
+        != target_ids.reshape(num_blocks, block_size)
+    )
+    positions = torch.arange(block_size, device=pred_ids.device).unsqueeze(0)
+    first_mismatch = torch.where(mismatch, positions, block_size).amin(dim=-1)
+    distance = (positions - first_mismatch.unsqueeze(-1)).clamp_min(0).float()
+    vat_weights = torch.exp(-distance / gamma)
+    fixed_weights = torch.exp(-positions.float() / gamma)
+    weights = torch.where(prefix_valid, vat_weights, fixed_weights)
+    weights = weights * valid.to(weights.dtype)
+    return weights.reshape_as(loss_mask), first_mismatch, prefix_valid
 
 
 def _fused_kernel(name: str):

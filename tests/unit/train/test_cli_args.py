@@ -138,6 +138,43 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     assert val_kw["confidence_head_alpha"] == 0.5
 
 
+def test_dspark_vat_weighting_reaches_train_and_validation(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type", "dspark",
+            "--loss-fn", '{"ce": 0.1, "tv": 0.9}',
+            "--per-position-loss-weight", "vat",
+            "--dflash-decay-gamma", "4",
+        ],
+    )
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["per_position_loss_weight"] == "vat"
+    assert val_kw["per_position_loss_weight"] == "vat"
+    assert train_kw["gamma"] == val_kw["gamma"] == 4.0
+
+
+@pytest.mark.parametrize(
+    "extra, reason",
+    [
+        (["--speculator-type", "dflash"], "requires dspark"),
+        (
+            ["--speculator-type", "dspark", "--no-sample-from-anchor"],
+            "requires --sample-from-anchor",
+        ),
+        (
+            ["--speculator-type", "dspark", "--dflash-decay-gamma", "0"],
+            "gamma > 0",
+        ),
+    ],
+)
+def test_vat_rejects_unsupported_settings(monkeypatch, capsys, extra, reason):
+    with pytest.raises(SystemExit) as exc:
+        _parse(monkeypatch, [*extra, "--per-position-loss-weight", "vat"])
+    assert exc.value.code == 2
+    assert reason in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

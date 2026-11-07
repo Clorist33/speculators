@@ -24,6 +24,7 @@ from speculators.losses import (
     dflash_loss_decay,
     dpace_loss_decay,
     tv_loss,
+    vat_loss_decay,
 )
 from speculators.models.metrics import (
     compute_accepted_length_counts,
@@ -35,6 +36,13 @@ __all__ = [
 ]
 
 _EPS = 1e-8
+
+
+def _precomputed_loss_decay(
+    pos_idx: torch.Tensor, weights: torch.Tensor, **_kwargs
+) -> torch.Tensor:
+    """Pass the same detached block weights to every compound loss term."""
+    return weights.to(pos_idx.dtype)
 
 
 def _masked_decayed_mean(
@@ -74,6 +82,11 @@ def compute_metrics(
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
     start_pos = 0 if sample_from_anchor else 1
+    pred_ids = torch.argmax(logits, dim=-1)
+    target_ids = torch.argmax(targets, dim=-1)
+    fixed_decay_fn = partial(
+        dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+    )
     if per_position_loss_weight == "dpace":
         decay_fn = partial(
             dpace_loss_decay,
@@ -81,9 +94,22 @@ def compute_metrics(
             block_size=block_size,
             dpace_alpha=dpace_alpha,
         )
+        confidence_decay_fn = decay_fn
+    elif per_position_loss_weight == "fixed-exp-decay":
+        decay_fn = fixed_decay_fn
+        confidence_decay_fn = decay_fn
+    elif per_position_loss_weight == "vat":
+        if not sample_from_anchor:
+            raise ValueError("VAT loss weighting requires sample_from_anchor=True")
+        vat_weights, first_mismatch, prefix_valid = vat_loss_decay(
+            pred_ids, target_ids, loss_mask, block_size, gamma
+        )
+        decay_fn = partial(_precomputed_loss_decay, weights=vat_weights)
+        # Keep the conditional acceptance-probability head on its old objective.
+        confidence_decay_fn = fixed_decay_fn
     else:
-        decay_fn = partial(
-            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+        raise ValueError(
+            f"Unknown per-position loss weight: {per_position_loss_weight}"
         )
 
     loss, term_losses = compound_loss(
@@ -104,12 +130,43 @@ def compute_metrics(
         accept_prefix = (accept_blocks[:, start_pos:] * draft_mask).cumprod(dim=-1)
 
     metrics: dict[str, Any] = {}
+    if per_position_loss_weight == "vat":
+        with torch.no_grad():
+            valid = loss_mask.reshape(num_blocks, block_size).bool()
+            valid_blocks = valid.any(dim=-1)
+            prefix_blocks = prefix_valid[:, 0]
+            block_count = valid_blocks.sum().clamp_min(1)
+            prefix_count = prefix_blocks.sum().clamp_min(1)
+            vat_block_weights = vat_weights.reshape(num_blocks, block_size).sum(-1)
+            fixed_block_weights = (
+                fixed_decay_fn(pos_idx.float()) * loss_mask.float()
+            ).reshape(num_blocks, block_size).sum(-1)
+            metrics["vat_weight_sum_sum"] = vat_block_weights.sum()
+            metrics["vat_weight_sum_total"] = block_count
+            metrics["vat_weight_ratio_sum"] = (
+                vat_block_weights / fixed_block_weights.clamp_min(_EPS)
+                * valid_blocks
+            ).sum()
+            metrics["vat_weight_ratio_total"] = block_count.clone()
+            metrics["vat_fallback_fraction_sum"] = (valid & ~prefix_valid).sum()
+            metrics["vat_fallback_fraction_total"] = valid.sum().clamp_min(1)
+            for pos in range(block_size):
+                metrics[f"vat_first_mismatch_{pos}_sum"] = (
+                    (first_mismatch == pos) & prefix_blocks
+                ).sum()
+                metrics[f"vat_first_mismatch_{pos}_total"] = prefix_count.clone()
+            metrics["vat_first_mismatch_none_sum"] = (
+                (first_mismatch == block_size) & prefix_blocks
+            ).sum()
+            metrics["vat_first_mismatch_none_total"] = prefix_count.clone()
     if confidence_logits is not None:
         c_star = accept_rate.detach().to(confidence_logits.dtype)
         bce = binary_cross_entropy_with_logits(
             confidence_logits, c_star, reduction="none"
         )  # [1, T]
-        conf_loss = _masked_decayed_mean(bce, loss_mask, pos_idx, decay_fn)
+        conf_loss = _masked_decayed_mean(
+            bce, loss_mask, pos_idx, confidence_decay_fn
+        )
         loss = loss + confidence_head_alpha * conf_loss
 
         with torch.no_grad():
@@ -157,8 +214,6 @@ def compute_metrics(
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 
     # Per-position greedy accuracy
-    pred_ids = torch.argmax(logits, dim=-1)
-    target_ids = torch.argmax(targets, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )

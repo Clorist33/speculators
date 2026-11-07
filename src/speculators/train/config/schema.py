@@ -4,6 +4,7 @@ Each tunable is one typed ``pydantic`` field; adding one is a one-field edit.
 :class:`TrainConfig` is the sole public type (``resolution`` builds the CLI).
 """
 
+import math
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Literal, cast
@@ -504,9 +505,9 @@ class DFlashArgs(_Group):
     dflash_decay_gamma: float = Field(
         default=4.0, description="Decay gamma for DFlash-family loss weighting."
     )
-    per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
+    per_position_loss_weight: Literal["fixed-exp-decay", "dpace", "vat"] | None = Field(
         default=None,
-        description="Per-position loss weight option for D-PACE support "
+        description="Per-position loss weight option (VAT is DSpark-only) "
         "(default: dpace for dflash, fixed-exp-decay otherwise).",
     )
     dpace_alpha: float = Field(
@@ -784,6 +785,19 @@ class TrainConfig(BaseSettings):
             if not 0.0 < self.dflash.dpace_alpha <= 1.0:
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
+                )
+        if self.dflash.per_position_loss_weight == "vat":
+            if self.speculator_type != "dspark":
+                raise ValueError("--per-position-loss-weight=vat requires dspark")
+            if self.dflash.sample_from_anchor is False:
+                raise ValueError(
+                    "--per-position-loss-weight=vat requires --sample-from-anchor"
+                )
+            gamma = self.dflash.dflash_decay_gamma
+            if not math.isfinite(gamma) or gamma <= 0:
+                raise ValueError(
+                    "--per-position-loss-weight=vat requires "
+                    "--dflash-decay-gamma > 0 and finite"
                 )
         return self
 

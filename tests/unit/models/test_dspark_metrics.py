@@ -4,8 +4,8 @@ from functools import partial
 
 import torch
 
-from speculators.losses import resolve_loss_config
-from speculators.losses.eager import tv_loss
+from speculators.losses import dflash_loss_decay, resolve_loss_config, vat_loss_decay
+from speculators.losses.eager import ce_loss, tv_loss
 from speculators.models.dspark.metrics import compute_metrics as _compute_metrics
 
 compute_metrics = partial(_compute_metrics, tv_loss_fn=tv_loss)
@@ -16,6 +16,98 @@ def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
     logits = torch.zeros(*ids.shape, vocab_size)
     logits.scatter_(-1, ids.unsqueeze(-1), 100.0)
     return logits
+
+
+def test_vat_loss_decay_first_mismatch_and_mask_boundaries():
+    pred_ids = torch.tensor([[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]])
+    target_ids = pred_ids.clone()
+    target_ids[0, 0] = 9  # First slot: exactly the original fixed decay.
+    target_ids[0, 6] = 9  # Third slot: first three weights stay at one.
+    target_ids[0, 15] = 9  # After a mask gap: not part of the same prefix.
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1]])
+
+    weights, first, prefix = vat_loss_decay(pred_ids, target_ids, mask, 4, 4.0)
+    fixed = torch.exp(-torch.arange(4).float() / 4)
+    expected = fixed.repeat(4, 1)
+    expected[1, :3] = 1
+    expected[1, 3] = fixed[1]
+    expected[2] = 1
+    expected[3, :2] = 1
+    expected[3, 2] = 0
+    torch.testing.assert_close(weights.reshape(4, 4), expected)
+    torch.testing.assert_close(first, torch.tensor([0, 2, 4, 4]))
+    torch.testing.assert_close(prefix[3], torch.tensor([True, True, False, False]))
+    assert not weights.requires_grad
+
+
+def test_vat_loss_decay_invalid_first_slot_and_empty_block():
+    ids = torch.tensor([[1, 2, 3, 4, 1, 2, 3, 4]])
+    mask = torch.tensor([[0, 1, 1, 1, 0, 0, 0, 0]])
+    weights, first, prefix = vat_loss_decay(ids, ids, mask, 4, 4.0)
+    fixed = torch.exp(-torch.arange(4).float() / 4)
+    expected = torch.cat((fixed * mask[0, :4], torch.zeros(4))).unsqueeze(0)
+    torch.testing.assert_close(weights, expected)
+    torch.testing.assert_close(first, torch.tensor([4, 4]))
+    assert not prefix.any()
+
+
+def test_vat_uses_valid_slot_denominator_and_keeps_confidence_fixed():
+    torch.manual_seed(7)
+    logits = torch.randn(1, 4, 6, requires_grad=True)
+    targets = logits.detach().clone()
+    other_id = (int(logits[0, 2].argmax()) + 1) % 6
+    targets[0, 2] = -10
+    targets[0, 2, other_id] = 10
+    confidence_logits = torch.randn(1, 4, requires_grad=True)
+    mask = torch.ones(1, 4)
+
+    loss, metrics = compute_metrics(
+        logits,
+        targets,
+        confidence_logits,
+        mask,
+        block_size=4,
+        loss_config=_DEFAULT_LOSS,
+        per_position_loss_weight="vat",
+    )
+    weights = torch.tensor([[1, 1, 1, float(torch.exp(torch.tensor(-0.25)))]])
+    per_pos_ce = ce_loss(logits, targets)
+    per_pos_tv = tv_loss(logits, targets)
+    expected_compound = (
+        (0.1 * per_pos_ce + 0.9 * per_pos_tv) * weights
+    ).sum() / (4 + 1e-5)
+    fixed = dflash_loss_decay(torch.arange(4).float().unsqueeze(0), 4, True)
+    per_pos_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        confidence_logits, 1 - per_pos_tv.detach(), reduction="none"
+    )
+    expected_conf = (per_pos_bce * fixed).sum() / (4 + 1e-8)
+    torch.testing.assert_close(loss, expected_compound + expected_conf)
+    torch.testing.assert_close(metrics["confidence_loss_sum"], expected_conf)
+    assert metrics["vat_first_mismatch_2_sum"] == 1
+    assert metrics["vat_weight_ratio_sum"] > 1
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert torch.isfinite(confidence_logits.grad).all()
+
+
+def test_vat_all_masked_has_zero_loss_and_gradients():
+    logits = torch.randn(1, 4, 6, requires_grad=True)
+    targets = torch.randn(1, 4, 6)
+    confidence = torch.randn(1, 4, requires_grad=True)
+    loss, metrics = compute_metrics(
+        logits,
+        targets,
+        confidence,
+        torch.zeros(1, 4),
+        block_size=4,
+        loss_config=_DEFAULT_LOSS,
+        per_position_loss_weight="vat",
+    )
+    loss.backward()
+    assert loss == 0
+    assert torch.count_nonzero(logits.grad) == 0
+    assert torch.count_nonzero(confidence.grad) == 0
+    assert metrics["vat_weight_sum_sum"] == 0
 
 
 class TestComputeMetrics:

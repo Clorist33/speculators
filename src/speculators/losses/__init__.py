@@ -15,6 +15,7 @@ from speculators.losses.utils import (
     resolve_loss_config,
     reverse_kl_div_loss,
     tv_loss,
+    vat_loss_decay,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "resolve_loss_config",
     "reverse_kl_div_loss",
     "tv_loss",
+    "vat_loss_decay",
 ]

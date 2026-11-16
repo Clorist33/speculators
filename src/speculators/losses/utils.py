@@ -3,6 +3,7 @@
 import json
 import math
 from collections.abc import Callable
+from functools import partial
 
 import torch
 
@@ -201,6 +202,42 @@ def lk_hybrid_loss(
     return _fused_kernel("fused_lk_hybrid_loss")(logits, targets, eta=eta)
 
 
+def lk_hybrid_slot_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    eta: float = 3.0,
+    implementation: str = "fused",
+) -> torch.Tensor:
+    """Paper LK hybrid: share one detached KL/TV blend per draft slot.
+
+    Acceptance is averaged over the valid occurrences of each slot in the
+    current local batch and sequence. This differs from ``lk_hybrid_loss``,
+    which computes a separate blend for every token. The caller applies the
+    ordinary loss mask, position decay, and reduction afterwards.
+    """
+    if block_size <= 0 or logits.shape[1] % block_size:
+        raise ValueError("sequence length must be divisible by a positive block_size")
+    if loss_mask.shape != logits.shape[:2]:
+        raise ValueError("loss_mask must match logits' batch and sequence dimensions")
+    if not math.isfinite(eta) or eta <= 0:
+        raise ValueError("eta must be positive and finite")
+
+    loss_fns = _LOSS_FN_MAPS[implementation]
+    kl = loss_fns["kl_div"](logits, targets)
+    tv = loss_fns["tv"](logits, targets)
+    valid = loss_mask.bool().reshape(-1, block_size)
+    with torch.no_grad():
+        overlap = (1.0 - tv.detach()).reshape(-1, block_size)
+        slot_acceptance = (overlap * valid).sum(dim=0) / valid.sum(dim=0).clamp_min(1)
+        slot_lambda = torch.exp(-eta * slot_acceptance)
+    token_lambda = slot_lambda.repeat(logits.shape[0] * logits.shape[1] // block_size)
+    token_lambda = token_lambda.reshape_as(kl)
+    return token_lambda * kl + (1.0 - token_lambda) * tv
+
+
 _FUSED_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
     "kl_div": kl_div_loss,
     "rkl": reverse_kl_div_loss,
@@ -209,6 +246,7 @@ _FUSED_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     "tv": tv_loss,
     "nla": neg_log_acceptance_loss,
     "lk_hybrid": lk_hybrid_loss,
+    "lk_hybrid_slot": partial(lk_hybrid_slot_loss, implementation="fused"),
 }
 
 
@@ -220,6 +258,7 @@ _EAGER_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     "tv": eager.tv_loss,
     "nla": eager.neg_log_acceptance_loss,
     "lk_hybrid": eager.lk_hybrid_loss,
+    "lk_hybrid_slot": partial(lk_hybrid_slot_loss, implementation="eager"),
 }
 
 
@@ -230,7 +269,8 @@ def resolve_loss_config(spec: str, implementation: str = "fused") -> LossConfig:
     """Parse a loss spec into ``{name: (loss_fn, weight)}``.
 
     Accepts either a plain loss name (``"kl_div"``) or a JSON dict mapping
-    loss names to weights (``'{"ce": 0.1, "tv": 0.9}'``).
+    loss names to weights (``'{"ce": 0.1, "tv": 0.9}'``). The paper-style
+    ``lk_hybrid_slot`` also needs a block size and mask from ``compound_loss``.
     """
     try:
         loss_fn_map = _LOSS_FN_MAPS[implementation]
@@ -282,6 +322,8 @@ def compound_loss(
     pos_idx: torch.Tensor,
     loss_config: LossConfig,
     decay_fn: Callable[..., torch.Tensor] | None = None,
+    block_size: int | None = None,
+    lk_eta: float = 3.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a weighted sum of loss terms.
 
@@ -297,6 +339,10 @@ def compound_loss(
     term_losses: dict[str, torch.Tensor] = {}
     multi = len(loss_config) > 1
     for name, (fn, weight) in loss_config.items():
+        if name == "lk_hybrid_slot":
+            if block_size is None:
+                raise ValueError("lk_hybrid_slot requires a draft block_size")
+            fn = partial(fn, loss_mask=loss_mask, block_size=block_size, eta=lk_eta)
         term = loss_function(
             logits,
             targets,

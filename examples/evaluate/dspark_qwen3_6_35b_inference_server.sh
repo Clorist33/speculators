@@ -143,3 +143,6 @@ vllm serve "$MODEL" \
     2>&1 | tee "$LOG"
 
 #     --no-enable-prefix-caching \
+# max-num-seqs: vLLM 教师端一次最多调度多少条序列,可以同时处理多条请求
+# concurrency: 客户端最多同时向教师发送多少个请求
+# max_num_batched_tokens：教师端这一次调度中，所有序列合计最多处理多少个 token

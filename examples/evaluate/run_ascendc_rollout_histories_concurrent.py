@@ -157,7 +157,15 @@ def main():
         counters = {key: after[key] - before[key] for key in (
             "drafts", "draft_tokens", "accepted_tokens"
         )}
-        positions = [after_positions[i] - before_positions.get(i, 0) for i in range(8)]
+        drafts = counters["drafts"]
+        draft_tokens = counters["draft_tokens"]
+        if not drafts or draft_tokens % drafts:
+            raise RuntimeError("Cannot determine the number of proposed draft positions")
+        position_count = draft_tokens // drafts
+        positions = [
+            after_positions[i] - before_positions.get(i, 0)
+            for i in range(position_count)
+        ]
         if sum(positions) != counters["accepted_tokens"]:
             raise RuntimeError("Per-position accepted counts disagree with total accepted count")
     rows.sort(key=lambda row: row["sample_index"])

@@ -4,8 +4,13 @@ from functools import partial
 
 import torch
 
-from speculators.losses import dflash_loss_decay, resolve_loss_config, vat_loss_decay
-from speculators.losses.eager import ce_loss, tv_loss
+from speculators.losses import (
+    dflash_loss_decay,
+    lk_hybrid_slot_loss,
+    resolve_loss_config,
+    vat_loss_decay,
+)
+from speculators.losses.eager import ce_loss, kl_div_loss, lk_hybrid_loss, tv_loss
 from speculators.models.dspark.metrics import compute_metrics as _compute_metrics
 
 compute_metrics = partial(_compute_metrics, tv_loss_fn=tv_loss)
@@ -16,6 +21,86 @@ def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
     logits = torch.zeros(*ids.shape, vocab_size)
     logits.scatter_(-1, ids.unsqueeze(-1), 100.0)
     return logits
+
+
+def test_lk_hybrid_slot_shares_lambda_and_excludes_masked_tokens():
+    logits = torch.tensor(
+        [[[4.0, 0, 0], [0, 4, 0], [4, 0, 0], [0, 0, 4]]],
+        requires_grad=True,
+    )
+    targets = torch.tensor([[[0.0, 4, 0], [0, 4, 0], [4, 0, 0], [4, 0, 0]]])
+    mask = torch.tensor([[1, 1, 1, 0]])
+    actual = lk_hybrid_slot_loss(
+        logits, targets, loss_mask=mask, block_size=2, implementation="eager"
+    )
+    tv = tv_loss(logits, targets)
+    kl = kl_div_loss(logits, targets)
+    slot_alpha = torch.stack(((2 - tv[0, 0] - tv[0, 2]) / 2, 1 - tv[0, 1]))
+    slot_lambda = torch.exp(-3.0 * slot_alpha.detach()).repeat(2).reshape(1, 4)
+    expected = slot_lambda * kl + (1 - slot_lambda) * tv
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual[:, 0], lk_hybrid_loss(logits, targets)[:, 0])
+
+    grad_actual = torch.autograd.grad((actual * mask).sum(), logits, retain_graph=True)[0]
+    grad_expected = torch.autograd.grad((expected * mask).sum(), logits)[0]
+    torch.testing.assert_close(grad_actual, grad_expected)
+
+
+def test_lk_hybrid_slot_keeps_ce_and_confidence_loss():
+    torch.manual_seed(3)
+    logits = torch.randn(1, 4, 6, requires_grad=True)
+    targets = torch.randn(1, 4, 6)
+    confidence = torch.randn(1, 4, requires_grad=True)
+    mask = torch.tensor([[1, 1, 1, 0]])
+    config = resolve_loss_config('{"ce":0.1,"lk_hybrid_slot":0.9}', "eager")
+    loss, metrics = compute_metrics(
+        logits,
+        targets,
+        confidence,
+        mask,
+        block_size=2,
+        loss_config=config,
+        lk_eta=3.0,
+        gamma=8.0,
+    )
+    decay = dflash_loss_decay(torch.arange(4).remainder(2).float()[None], 8, True)
+    lk = lk_hybrid_slot_loss(
+        logits, targets, loss_mask=mask, block_size=2, implementation="eager"
+    )
+    compound = ((0.1 * ce_loss(logits, targets) + 0.9 * lk) * mask * decay).sum()
+    compound = compound / (mask.sum() + 1e-5)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        confidence, 1 - tv_loss(logits, targets).detach(), reduction="none"
+    )
+    conf_loss = (bce * mask * decay).sum() / (mask.sum() + 1e-8)
+    torch.testing.assert_close(loss, compound + conf_loss)
+    torch.testing.assert_close(
+        metrics["ce_loss_sum"],
+        (ce_loss(logits, targets) * mask * decay).sum() / (mask.sum() + 1e-5),
+    )
+    torch.testing.assert_close(
+        metrics["lk_hybrid_slot_loss_sum"],
+        (lk * mask * decay).sum() / (mask.sum() + 1e-5),
+    )
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert torch.isfinite(confidence.grad).all()
+
+
+def test_lk_hybrid_slot_all_masked_has_zero_loss_and_gradients():
+    logits = torch.randn(1, 4, 6, requires_grad=True)
+    targets = torch.randn(1, 4, 6)
+    loss, _ = compute_metrics(
+        logits,
+        targets,
+        None,
+        torch.zeros(1, 4),
+        block_size=2,
+        loss_config=resolve_loss_config("lk_hybrid_slot", "eager"),
+    )
+    loss.backward()
+    assert loss == 0
+    assert torch.count_nonzero(logits.grad) == 0
 
 
 def test_vat_loss_decay_first_mismatch_and_mask_boundaries():

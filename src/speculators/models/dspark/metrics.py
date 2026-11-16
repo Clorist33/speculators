@@ -72,6 +72,7 @@ def compute_metrics(
     tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
+    lk_eta: float = 3.0,
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
@@ -113,7 +114,14 @@ def compute_metrics(
         )
 
     loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
+        logits,
+        targets,
+        loss_mask,
+        pos_idx,
+        loss_config=loss_config,
+        decay_fn=decay_fn,
+        block_size=block_size,
+        lk_eta=lk_eta,
     )
 
     # Analytical per-position acceptance rate = distributional overlap

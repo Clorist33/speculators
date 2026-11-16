@@ -131,6 +131,36 @@ def test_dspark_compound_loss(monkeypatch):
     assert "tv" in val_kw["loss_config"]
 
 
+def test_dspark_paper_lk_configuration_reaches_train_and_validation(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type", "dspark",
+            "--loss-fn", '{"ce": 0.1, "lk_hybrid_slot": 0.9}',
+            "--lk-eta", "3",
+        ],
+    )
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["loss_config"]["ce"][1] == 0.1
+    assert train_kw["loss_config"]["lk_hybrid_slot"][1] == 0.9
+    assert "lk_hybrid" not in train_kw["loss_config"]
+    assert train_kw["lk_eta"] == val_kw["lk_eta"] == 3.0
+
+
+def test_paper_lk_requires_dspark(monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type", "dflash",
+                "--loss-fn", "lk_hybrid_slot",
+                "--per-position-loss-weight", "fixed-exp-decay",
+            ],
+        )
+    assert exc.value.code == 2
+    assert "requires dspark" in capsys.readouterr().err
+
+
 def test_dspark_confidence_head_alpha(monkeypatch):
     args = _parse(monkeypatch, ["--confidence-head-alpha", "0.5"])
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))

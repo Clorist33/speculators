@@ -337,8 +337,14 @@ class LossArgs(_Group):
     loss_fn: str | None = Field(
         default=None,
         description="Loss function specification. A name (kl_div, rkl, jsd, ce, tv, "
-        'nla, lk_hybrid) or a JSON dict for a weighted combination, e.g. \'{"ce": 0.1, '
+        'nla, lk_hybrid, lk_hybrid_slot) or a JSON dict for a weighted combination, e.g. \'{"ce": 0.1, '
         '"tv": 0.9}\'. (default: "ce" for dflash, "kl_div" otherwise).',
+    )
+    lk_eta: float = Field(
+        default=3.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Positive blend temperature for the paper-style lk_hybrid_slot loss.",
     )
     ttt_steps: int = Field(
         default=3,
@@ -799,6 +805,11 @@ class TrainConfig(BaseSettings):
                     "--per-position-loss-weight=vat requires "
                     "--dflash-decay-gamma > 0 and finite"
                 )
+        if (
+            self.speculator_type != "dspark"
+            and "lk_hybrid_slot" in self.loss.loss_fn
+        ):
+            raise ValueError("--loss-fn=lk_hybrid_slot requires dspark")
         return self
 
     def flatten(self) -> dict[str, Any]:

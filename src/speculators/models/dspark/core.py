@@ -102,6 +102,7 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
         max_anchors = kwargs.get("max_anchors", 3072)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
+        lk_eta = kwargs.get("lk_eta", 3.0)
         per_position_loss_weight = kwargs.get(
             "per_position_loss_weight", "fixed-exp-decay"
         )
@@ -112,6 +113,7 @@ class DSparkDraftModel(DFlashDraftModel):
             "gamma": gamma,
             "max_anchors": max_anchors,
             "confidence_head_alpha": confidence_head_alpha,
+            "lk_eta": lk_eta,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
         }
@@ -131,6 +133,7 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
+        lk_eta: float = 3.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
         **kwargs,
@@ -205,6 +208,7 @@ class DSparkDraftModel(DFlashDraftModel):
             tv_loss_fn=tv_loss_fn,
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
+            lk_eta=lk_eta,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
